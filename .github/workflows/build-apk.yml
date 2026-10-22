@@ -129,7 +129,7 @@ jobs:
                   android:allowBackup="false"
                   android:icon="@drawable/ic_launcher"
                   android:label="Web2APK"
-                  android:theme="@android:style/Theme.Material.Light">
+                  android:theme="@android:style/Theme.Material.NoActionBar">
 
                   <activity
                       android:name="com.web2apk.builder.MainActivity"
@@ -451,19 +451,25 @@ jobs:
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.Intent;
+          import android.content.res.ColorStateList;
           import android.database.Cursor;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.graphics.drawable.RippleDrawable;
           import android.net.Uri;
           import android.os.Bundle;
           import android.provider.OpenableColumns;
           import android.provider.Settings;
           import android.text.InputType;
+          import android.view.Gravity;
           import android.view.View;
           import android.view.ViewGroup;
           import android.widget.Button;
           import android.widget.EditText;
           import android.widget.LinearLayout;
-          import android.widget.RadioButton;
-          import android.widget.RadioGroup;
+          import android.widget.ProgressBar;
           import android.widget.ScrollView;
           import android.widget.TextView;
           import android.widget.Toast;
@@ -489,124 +495,273 @@ jobs:
               private static final int REQ_PICK = 1;
               private static final long MAX_BYTES = 64L * 1024 * 1024;
 
+              // palette
+              private static final int BG = 0xFF0B1020;
+              private static final int CARD = 0xFF161D33;
+              private static final int STROKE = 0xFF26304D;
+              private static final int INPUT_BG = 0xFF0F1630;
+              private static final int TEXT = 0xFFF1F5F9;
+              private static final int MUTED = 0xFF94A3B8;
+              private static final int ACCENT = 0xFF3B82F6;
+              private static final int ACCENT2 = 0xFF8B5CF6;
+              private static final int OK = 0xFF34D399;
+              private static final int ERR = 0xFFF87171;
+
               private EditText nameInput;
               private EditText urlInput;
-              private RadioButton linkRadio;
+              private TextView segLink;
+              private TextView segFile;
               private LinearLayout linkBox;
               private LinearLayout fileBox;
-              private LinearLayout resultBox;
               private TextView pickedText;
-              private TextView statusText;
               private Button buildBtn;
+              private LinearLayout statusCard;
+              private ProgressBar progress;
+              private TextView statusText;
+              private LinearLayout resultCard;
+              private TextView resultInfo;
 
+              private boolean linkMode = true;
               private final List<Uri> picked = new ArrayList<>();
               private File lastApk;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
-                  setTitle("Web2APK");
+                  getWindow().setStatusBarColor(BG);
+                  getWindow().setNavigationBarColor(BG);
 
                   ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(BG);
+                  scroll.setFillViewport(true);
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  int pad = dp(20);
-                  root.setPadding(pad, pad, pad, pad);
+                  root.setPadding(dp(20), dp(28), dp(20), dp(28));
                   scroll.addView(root, new ViewGroup.LayoutParams(
                           ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
                   setContentView(scroll);
 
-                  root.addView(heading("App name"));
-                  nameInput = new EditText(this);
-                  nameInput.setHint("My App");
-                  nameInput.setSingleLine(true);
-                  root.addView(nameInput);
+                  // ---- header
+                  root.addView(text("Web2APK", 32f, TEXT, true));
+                  TextView sub = text("Turn any link or HTML page into an installable app.", 15f, MUTED, false);
+                  sub.setPadding(0, dp(4), 0, dp(20));
+                  root.addView(sub);
 
-                  root.addView(heading("Make the app from"));
-                  RadioGroup group = new RadioGroup(this);
-                  group.setOrientation(RadioGroup.VERTICAL);
-                  linkRadio = new RadioButton(this);
-                  linkRadio.setText("A website link");
-                  linkRadio.setId(View.generateViewId());
-                  RadioButton fileRadio = new RadioButton(this);
-                  fileRadio.setText("Local HTML file(s) from this phone");
-                  fileRadio.setId(View.generateViewId());
-                  group.addView(linkRadio);
-                  group.addView(fileRadio);
-                  root.addView(group);
+                  // ---- main card
+                  LinearLayout card = card();
+                  root.addView(card, matchWrap(0));
+
+                  card.addView(label("APP NAME"));
+                  nameInput = input("My App");
+                  card.addView(nameInput);
+
+                  card.addView(label("SOURCE"));
+                  LinearLayout seg = new LinearLayout(this);
+                  seg.setOrientation(LinearLayout.HORIZONTAL);
+                  seg.setPadding(dp(4), dp(4), dp(4), dp(4));
+                  seg.setBackground(rounded(INPUT_BG, 14, STROKE, 1));
+                  segLink = segment("Website link");
+                  segFile = segment("HTML files");
+                  seg.addView(segLink, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  seg.addView(segFile, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  segLink.setOnClickListener(v -> setMode(true));
+                  segFile.setOnClickListener(v -> setMode(false));
+                  card.addView(seg);
 
                   linkBox = new LinearLayout(this);
                   linkBox.setOrientation(LinearLayout.VERTICAL);
-                  urlInput = new EditText(this);
-                  urlInput.setHint("https://example.com");
-                  urlInput.setSingleLine(true);
+                  linkBox.setPadding(0, dp(12), 0, 0);
+                  urlInput = input("https://example.com");
                   urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
                   linkBox.addView(urlInput);
-                  root.addView(linkBox);
+                  card.addView(linkBox);
 
                   fileBox = new LinearLayout(this);
                   fileBox.setOrientation(LinearLayout.VERTICAL);
-                  Button pickBtn = new Button(this);
-                  pickBtn.setText("Choose HTML file(s)");
-                  pickBtn.setOnClickListener(v -> pickFiles());
-                  pickedText = new TextView(this);
-                  pickedText.setText("Nothing chosen yet. Pick your .html file, plus any .css/.js/images it uses.");
-                  fileBox.addView(pickBtn);
-                  fileBox.addView(pickedText);
-                  root.addView(fileBox);
+                  fileBox.setPadding(0, dp(12), 0, 0);
+                  LinearLayout pickCard = new LinearLayout(this);
+                  pickCard.setOrientation(LinearLayout.VERTICAL);
+                  pickCard.setGravity(Gravity.CENTER_HORIZONTAL);
+                  pickCard.setPadding(dp(16), dp(20), dp(16), dp(20));
+                  GradientDrawable dashed = rounded(INPUT_BG, 14, ACCENT, 1);
+                  dashed.setStroke(dp(1), ACCENT, dp(6), dp(4));
+                  pickCard.setBackground(rippled(dashed, 14));
+                  pickCard.setClickable(true);
+                  pickCard.setOnClickListener(v -> pickFiles());
+                  TextView pickTitle = text("Choose HTML file(s)", 16f, ACCENT, true);
+                  pickTitle.setGravity(Gravity.CENTER);
+                  pickedText = text("Pick your .html file plus any .css, .js or images it uses.", 13f, MUTED, false);
+                  pickedText.setGravity(Gravity.CENTER);
+                  pickedText.setPadding(0, dp(6), 0, 0);
+                  pickCard.addView(pickTitle);
+                  pickCard.addView(pickedText);
+                  fileBox.addView(pickCard);
+                  card.addView(fileBox);
 
-                  buildBtn = new Button(this);
-                  buildBtn.setText("Build APK");
+                  // ---- build button
+                  buildBtn = button("Build APK", true);
                   buildBtn.setOnClickListener(v -> startBuild());
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                  lp.topMargin = dp(16);
-                  root.addView(buildBtn, lp);
+                  root.addView(buildBtn, matchWrap(18));
 
-                  statusText = new TextView(this);
-                  statusText.setPadding(0, dp(12), 0, dp(12));
-                  root.addView(statusText);
+                  // ---- status card (building / error)
+                  statusCard = card();
+                  statusCard.setOrientation(LinearLayout.HORIZONTAL);
+                  statusCard.setGravity(Gravity.CENTER_VERTICAL);
+                  statusCard.setVisibility(View.GONE);
+                  progress = new ProgressBar(this);
+                  progress.setIndeterminateTintList(ColorStateList.valueOf(ACCENT));
+                  statusCard.addView(progress, new LinearLayout.LayoutParams(dp(28), dp(28)));
+                  statusText = text("", 15f, TEXT, false);
+                  LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(
+                          0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                  stLp.leftMargin = dp(14);
+                  statusCard.addView(statusText, stLp);
+                  root.addView(statusCard, matchWrap(16));
 
-                  resultBox = new LinearLayout(this);
-                  resultBox.setOrientation(LinearLayout.VERTICAL);
-                  resultBox.setVisibility(View.GONE);
-                  Button installBtn = new Button(this);
-                  installBtn.setText("Install");
+                  // ---- result card
+                  resultCard = card();
+                  resultCard.setVisibility(View.GONE);
+                  resultCard.addView(text("✓  Your app is ready", 18f, OK, true));
+                  resultInfo = text("", 13f, MUTED, false);
+                  resultInfo.setPadding(0, dp(4), 0, dp(14));
+                  resultCard.addView(resultInfo);
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  Button installBtn = button("Install", true);
                   installBtn.setOnClickListener(v -> installApk());
-                  Button shareBtn = new Button(this);
-                  shareBtn.setText("Share / save APK");
+                  Button shareBtn = button("Share / save", false);
                   shareBtn.setOnClickListener(v -> shareApk());
-                  resultBox.addView(installBtn);
-                  resultBox.addView(shareBtn);
-                  root.addView(resultBox);
+                  row.addView(installBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  LinearLayout.LayoutParams shLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                  shLp.leftMargin = dp(10);
+                  row.addView(shareBtn, shLp);
+                  resultCard.addView(row);
+                  root.addView(resultCard, matchWrap(16));
 
-                  group.setOnCheckedChangeListener((g, id) -> updateMode());
-                  linkRadio.setChecked(true);
-                  updateMode();
+                  // ---- footer
+                  TextView foot = text("Apps are signed on this phone. Android or Play Protect may warn about "
+                          + "unknown apps: tap “Install anyway”.", 12f, MUTED, false);
+                  foot.setPadding(dp(4), dp(20), dp(4), 0);
+                  root.addView(foot);
+
+                  setMode(true);
               }
 
-              // ------------------------------------------------------------------ UI helpers
+              // ------------------------------------------------------------------ styling helpers
 
               private int dp(int v) {
-                  return (int) (v * getResources().getDisplayMetrics().density);
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
               }
 
-              private TextView heading(String text) {
+              private GradientDrawable rounded(int color, int radiusDp, int strokeColor, int strokeDp) {
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(color);
+                  d.setCornerRadius(dp(radiusDp));
+                  if (strokeDp > 0) d.setStroke(dp(strokeDp), strokeColor);
+                  return d;
+              }
+
+              private GradientDrawable rounded(int color, int radiusDp) {
+                  return rounded(color, radiusDp, 0, 0);
+              }
+
+              private Drawable rippled(Drawable content, int radiusDp) {
+                  return new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), content, rounded(Color.WHITE, radiusDp));
+              }
+
+              private LinearLayout.LayoutParams matchWrap(int topMarginDp) {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = dp(topMarginDp);
+                  return lp;
+              }
+
+              private LinearLayout card() {
+                  LinearLayout c = new LinearLayout(this);
+                  c.setOrientation(LinearLayout.VERTICAL);
+                  c.setPadding(dp(18), dp(16), dp(18), dp(18));
+                  c.setBackground(rounded(CARD, 22, STROKE, 1));
+                  return c;
+              }
+
+              private TextView text(String s, float sp, int color, boolean bold) {
                   TextView t = new TextView(this);
-                  t.setText(text);
-                  t.setTextSize(16f);
-                  t.setPadding(0, dp(16), 0, dp(4));
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  t.setTypeface(bold ? Typeface.create("sans-serif-medium", Typeface.BOLD)
+                          : Typeface.create("sans-serif", Typeface.NORMAL));
                   return t;
+              }
+
+              private TextView label(String s) {
+                  TextView t = text(s, 12f, MUTED, true);
+                  t.setLetterSpacing(0.1f);
+                  t.setPadding(dp(2), dp(14), 0, dp(8));
+                  return t;
+              }
+
+              private EditText input(String hint) {
+                  EditText e = new EditText(this);
+                  e.setHint(hint);
+                  e.setHintTextColor(0xFF5B6784);
+                  e.setTextColor(TEXT);
+                  e.setTextSize(16f);
+                  e.setSingleLine(true);
+                  e.setPadding(dp(16), dp(14), dp(16), dp(14));
+                  e.setBackground(rounded(INPUT_BG, 14, STROKE, 1));
+                  return e;
+              }
+
+              private TextView segment(String s) {
+                  TextView t = text(s, 15f, MUTED, true);
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(dp(8), dp(11), dp(8), dp(11));
+                  t.setClickable(true);
+                  return t;
+              }
+
+              private Button button(String s, boolean primary) {
+                  Button b = new Button(this);
+                  b.setText(s);
+                  b.setAllCaps(false);
+                  b.setTextColor(Color.WHITE);
+                  b.setTextSize(16f);
+                  b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+                  b.setStateListAnimator(null);
+                  b.setMinHeight(0);
+                  b.setMinimumHeight(0);
+                  b.setPadding(dp(16), dp(15), dp(16), dp(15));
+                  Drawable bg;
+                  if (primary) {
+                      GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                              new int[]{ACCENT, ACCENT2});
+                      g.setCornerRadius(dp(16));
+                      bg = g;
+                  } else {
+                      bg = rounded(0x00000000, 16, STROKE, 1);
+                  }
+                  b.setBackground(rippled(bg, 16));
+                  return b;
+              }
+
+              private void setMode(boolean link) {
+                  linkMode = link;
+                  segLink.setBackground(link ? rounded(ACCENT, 10) : null);
+                  segLink.setTextColor(link ? Color.WHITE : MUTED);
+                  segFile.setBackground(link ? null : rounded(ACCENT, 10));
+                  segFile.setTextColor(link ? MUTED : Color.WHITE);
+                  linkBox.setVisibility(link ? View.VISIBLE : View.GONE);
+                  fileBox.setVisibility(link ? View.GONE : View.VISIBLE);
+              }
+
+              private void setBusy(boolean busy) {
+                  buildBtn.setEnabled(!busy);
+                  buildBtn.setAlpha(busy ? 0.5f : 1f);
               }
 
               private void toast(String msg) {
                   Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
-              }
-
-              private void updateMode() {
-                  boolean link = linkRadio.isChecked();
-                  linkBox.setVisibility(link ? View.VISIBLE : View.GONE);
-                  fileBox.setVisibility(link ? View.GONE : View.VISIBLE);
               }
 
               // ------------------------------------------------------------------ picking files
@@ -639,9 +794,15 @@ jobs:
                           getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                       } catch (Exception ignored) {
                       }
-                      sb.append("• ").append(displayName(u)).append('\n');
+                      sb.append(displayName(u)).append('\n');
                   }
-                  pickedText.setText(picked.isEmpty() ? "Nothing chosen yet." : sb.toString().trim());
+                  if (picked.isEmpty()) {
+                      pickedText.setTextColor(MUTED);
+                      pickedText.setText("Nothing chosen yet.");
+                  } else {
+                      pickedText.setTextColor(TEXT);
+                      pickedText.setText(sb.toString().trim());
+                  }
               }
 
               private String displayName(Uri uri) {
@@ -676,7 +837,7 @@ jobs:
                       toast("Enter an app name");
                       return;
                   }
-                  final boolean link = linkRadio.isChecked();
+                  final boolean link = linkMode;
                   final String url = urlInput.getText().toString().trim();
                   if (link && url.isEmpty()) {
                       toast("Enter a website link");
@@ -688,9 +849,12 @@ jobs:
                   }
                   final List<Uri> uris = new ArrayList<>(picked);
 
-                  buildBtn.setEnabled(false);
-                  resultBox.setVisibility(View.GONE);
-                  statusText.setText("Building… this takes a few seconds.");
+                  setBusy(true);
+                  resultCard.setVisibility(View.GONE);
+                  statusCard.setVisibility(View.VISIBLE);
+                  progress.setVisibility(View.VISIBLE);
+                  statusText.setTextColor(TEXT);
+                  statusText.setText("Building your app…");
 
                   new Thread(() -> {
                       try {
@@ -770,15 +934,18 @@ jobs:
 
               private void onBuilt(File apk) {
                   lastApk = apk;
-                  buildBtn.setEnabled(true);
-                  statusText.setText("Done: " + apk.getName() + " (" + (apk.length() / 1024) + " KB)");
-                  resultBox.setVisibility(View.VISIBLE);
+                  setBusy(false);
+                  statusCard.setVisibility(View.GONE);
+                  resultInfo.setText(apk.getName() + "  ·  " + (apk.length() / 1024) + " KB");
+                  resultCard.setVisibility(View.VISIBLE);
               }
 
               private void onFailed(Throwable t) {
-                  buildBtn.setEnabled(true);
+                  setBusy(false);
+                  progress.setVisibility(View.GONE);
                   String msg = String.valueOf(t);
                   if (t.getCause() != null) msg += "\n" + t.getCause();
+                  statusText.setTextColor(ERR);
                   statusText.setText("Build failed:\n" + msg);
               }
 
