@@ -27,4 +27,4 @@ jobs:
 
       # Runs a single command using the runners shell
       - name: Unzip the project
-        run: unzip web2app.zip
+        run: unzip web2apk.zip
