@@ -1,0 +1,266 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App name (shown under the icon)"
+        required: false
+        default: "Web App"
+      url:
+        description: "Website link to wrap (leave EMPTY to use www/index.html from this repo)"
+        required: false
+        default: ""
+      package_id:
+        description: "Package id, lowercase, e.g. com.me.mysite"
+        required: false
+        default: "com.example.webapp"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Generate Android project
+        run: |
+          set -e
+          P=_proj
+          mkdir -p $P/app/src/main/java/com/web2apk/app $P/app/src/main/res/drawable $P/www
+
+          cat > $P/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "web2apk"
+          include(":app")
+          EOF
+
+          cat > $P/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > $P/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          val appName = (findProperty("appName") as String?)?.takeIf { it.isNotBlank() } ?: "Web App"
+          val appUrl = (findProperty("appUrl") as String?)?.trim() ?: ""
+          val appId = (findProperty("appId") as String?)?.takeIf { it.isNotBlank() } ?: "com.example.webapp"
+
+          android {
+              namespace = "com.web2apk.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = appId
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+
+                  val safeUrl = appUrl.replace("\\", "\\\\").replace("\"", "\\\"")
+                  buildConfigField("String", "START_URL", "\"$safeUrl\"")
+                  resValue("string", "app_name", appName.replace("'", "\\'").replace("\"", ""))
+              }
+
+              buildFeatures {
+                  buildConfig = true
+              }
+
+              sourceSets {
+                  getByName("main") {
+                      assets.srcDirs("../www")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $P/app/src/main/java/com/web2apk/app/MainActivity.kt <<'EOF'
+          package com.web2apk.app
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+
+          class MainActivity : Activity() {
+
+              private lateinit var webView: WebView
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  webView = WebView(this)
+                  setContentView(webView)
+
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      databaseEnabled = true
+                      mediaPlaybackRequiresUserGesture = false
+                      allowFileAccess = true
+                      mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                      useWideViewPort = true
+                      loadWithOverviewMode = true
+                  }
+
+                  webView.webChromeClient = WebChromeClient()
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                          val scheme = request.url.scheme ?: return false
+                          if (scheme == "http" || scheme == "https" || scheme == "file") return false
+                          return try {
+                              startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(request.url.toString())))
+                              true
+                          } catch (e: Exception) {
+                              true
+                          }
+                      }
+                  }
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState)
+                  } else {
+                      val url = BuildConfig.START_URL
+                      if (url.isNotBlank()) {
+                          val full = if (url.startsWith("http://") || url.startsWith("https://")) url else "https://$url"
+                          webView.loadUrl(full)
+                      } else {
+                          webView.loadUrl("file:///android_asset/index.html")
+                      }
+                  }
+              }
+
+              override fun onSaveInstanceState(outState: Bundle) {
+                  super.onSaveInstanceState(outState)
+                  webView.saveState(outState)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > $P/app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#3B82F6"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,24a30,30 0 1,0 0.001,0z M54,30c3,0 7,6 8.5,18h-17C47,36 51,30 54,30z M45,48c-0.3,4 -0.3,8 0,12h-10.5c-0.9,-4 -0.9,-8 0,-12z M73.5,48c0.9,4 0.9,8 0,12H63c0.3,-4 0.3,-8 0,-12z M45.5,60h17C61,72 57,78 54,78s-7,-6 -8.5,-18z"
+                  android:fillType="evenOdd" />
+          </vector>
+          EOF
+
+          # Your own HTML: if the repo has a www/ folder, bundle it. Otherwise use a sample page.
+          if [ -d www ]; then
+            cp -r www/. $P/www/
+          else
+            cat > $P/www/index.html <<'EOF'
+          <!doctype html>
+          <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Web App</title></head>
+          <body style="font-family:sans-serif;padding:2rem"><h1>It works</h1>
+          <p>Add a www/index.html to your repo to use your own page.</p></body></html>
+          EOF
+          fi
+
+      - name: Build debug APK
+        working-directory: _proj
+        env:
+          APP_NAME: ${{ inputs.app_name || 'Web App' }}
+          APP_URL: ${{ inputs.url || '' }}
+          APP_ID: ${{ inputs.package_id || 'com.example.webapp' }}
+        run: gradle assembleDebug --no-daemon -PappName="$APP_NAME" -PappUrl="$APP_URL" -PappId="$APP_ID"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: _proj/app/build/outputs/apk/debug/*.apk
