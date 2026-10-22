@@ -1,0 +1,300 @@
+
+name: Build Android APK from URL or HTML
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Name der Android-App"
+        required: true
+        default: "My Web App"
+        type: string
+      package_id:
+        description: "Package ID"
+        required: true
+        default: "com.example.webapp"
+        type: string
+      source_type:
+        description: "Quelle"
+        required: true
+        default: "url"
+        type: choice
+        options:
+          - url
+          - html
+      source_url:
+        description: "Website-URL bei URL-Modus"
+        required: false
+        default: "https://example.com"
+        type: string
+      html_url:
+        description: "Direkter HTTPS-Link zur HTML-Datei bei HTML-Modus"
+        required: false
+        default: ""
+        type: string
+      icon_url:
+        description: "Direkter HTTPS-Link zu einem PNG-App-Icon (optional)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate inputs
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_ID: ${{ inputs.package_id }}
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          HTML_URL: ${{ inputs.html_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "$APP_NAME" ]] || {
+            echo "App name is required"
+            exit 1
+          }
+
+          [[ "$PACKAGE_ID" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || {
+            echo "Invalid package ID"
+            exit 1
+          }
+
+          if [[ "$SOURCE_TYPE" == "url" ]]; then
+            [[ "$SOURCE_URL" =~ ^https?:// ]] || {
+              echo "Invalid website URL"
+              exit 1
+            }
+          else
+            [[ "$HTML_URL" =~ ^https:// ]] || {
+              echo "HTML mode requires an HTTPS URL"
+              exit 1
+            }
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create Android project from scratch
+        shell: bash
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_ID: ${{ inputs.package_id }}
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          HTML_URL: ${{ inputs.html_url }}
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p app/src/main/java
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/assets
+
+          PKG_PATH="${PACKAGE_ID//./\/}"
+          mkdir -p "app/src/main/java/$PKG_PATH"
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GeneratedWebApp"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace System.getenv("PACKAGE_ID")
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId System.getenv("PACKAGE_ID")
+                  minSdk 23
+                  targetSdk 28
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF
+
+          # Generate manifest safely, including the app name.
+          export APP_NAME
+          python3 <<'PY'
+          import os
+          from xml.sax.saxutils import escape
+
+          name = escape(os.environ["APP_NAME"], {'"': '&quot;', "'": '&apos;'})
+          manifest = f'''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application
+                  android:label="{name}"
+                  android:icon="@drawable/app_icon"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>'''
+          os.makedirs("app/src/main", exist_ok=True)
+          open("app/src/main/AndroidManifest.xml", "w").write(manifest)
+          PY
+
+          # Download selected HTML or configure a URL.
+          if [[ "$SOURCE_TYPE" == "url" ]]; then
+            printf '%s' "$SOURCE_URL" > app/src/main/assets/start_url.txt
+          else
+            curl --fail --location --silent --show-error \
+              --max-time 30 "$HTML_URL" \
+              -o app/src/main/assets/index.html
+          fi
+
+          # Download custom icon or create a default vector icon.
+          if [[ -n "$ICON_URL" ]]; then
+            curl --fail --location --silent --show-error \
+              --max-time 30 "$ICON_URL" \
+              -o app/src/main/res/drawable/app_icon.png
+
+            file app/src/main/res/drawable/app_icon.png | grep -qi 'PNG image' || {
+              echo "Icon URL must return a PNG image"
+              exit 1
+            }
+          else
+            cat > app/src/main/res/drawable/app_icon.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path android:fillColor="#2563EB"
+                  android:pathData="M0,0h48v48h-48z"/>
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M10,12h28v4h-28zM10,22h28v4h-28zM10,32h20v4h-20z"/>
+          </vector>
+          EOF
+          fi
+
+          cat > "app/src/main/java/$PKG_PATH/MainActivity.java" <<EOF
+          package $PACKAGE_ID;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+
+              @Override
+              public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  web = new WebView(this);
+                  setContentView(web);
+
+                  WebSettings settings = web.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  web.setWebViewClient(new WebViewClient());
+                  web.setWebChromeClient(new WebChromeClient());
+
+                  try {
+                      BufferedReader reader = new BufferedReader(
+                          new InputStreamReader(
+                              getAssets().open("start_url.txt"), "UTF-8"));
+                      String url = reader.readLine();
+                      reader.close();
+                      web.loadUrl(url);
+                  } catch (Exception e) {
+                      web.loadUrl("file:///android_asset/index.html");
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web != null && web.canGoBack()) {
+                      web.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --version >/dev/null || true
+          mkdir -p "$HOME/.gradle"
+          curl --fail --location --silent --show-error \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip \
+            -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+          /tmp/gradle-8.9/bin/gradle --no-daemon assembleDebug
+
+      - name: Rename APK
+        shell: bash
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          SAFE_NAME="$(printf '%s' "$APP_NAME" | tr -cs 'A-Za-z0-9._-' '_')"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             "app/build/outputs/apk/debug/${SAFE_NAME}.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          
