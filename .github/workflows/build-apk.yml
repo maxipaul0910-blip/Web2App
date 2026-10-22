@@ -1,0 +1,1097 @@
+name: Build Web2APK app
+
+# Builds an Android app that turns website links or local HTML files into installable APKs
+# directly on your phone. Runs automatically when this file is committed; open the finished
+# run and download the "Web2APK-app" artifact.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Generate project
+        run: |
+          set -e
+          P=_proj
+          mkdir -p $P/builder $P/builder/src/main $P/builder/src/main/java/com/web2apk/builder $P/builder/src/main/res/drawable $P/builder/src/main/res/xml $P/template $P/template/src/main $P/template/src/main/java/com/web2apk/template $P/template/src/main/res/drawable-nodpi
+
+          cat > $P/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+          }
+          EOF
+
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > $P/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "web2apk"
+          include(":template", ":builder")
+          EOF
+
+          cat > $P/builder/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+          }
+
+          android {
+              namespace = "com.web2apk.builder"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.web2apk.builder"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              androidResources {
+                  noCompress += "apk"
+              }
+
+              sourceSets {
+                  getByName("main") {
+                      assets.srcDir(layout.buildDirectory.dir("generated/template"))
+                  }
+              }
+
+              lint {
+                  abortOnError = false
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core:1.13.1")
+              implementation("com.android.tools.build:apksig:8.7.3")
+          }
+
+          // Build the blank template app first and embed its APK as assets/template.apk
+          val copyTemplateApk = tasks.register<Copy>("copyTemplateApk") {
+              dependsOn(":template:assembleRelease")
+              from(project(":template").layout.buildDirectory.dir("outputs/apk/release")) {
+                  include("*.apk")
+                  rename { "template.apk" }
+              }
+              into(layout.buildDirectory.dir("generated/template"))
+          }
+
+          tasks.configureEach {
+              if (name.startsWith("merge") && name.endsWith("Assets")) {
+                  dependsOn(copyTemplateApk)
+              }
+          }
+          EOF
+
+          cat > $P/builder/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Web2APK"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity
+                      android:name="com.web2apk.builder.MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="com.web2apk.builder.files"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $P/builder/src/main/java/com/web2apk/builder/ApkPatcher.java <<'EOF'
+          package com.web2apk.builder;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FilterOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.text.Normalizer;
+          import java.util.Enumeration;
+          import java.util.Iterator;
+          import java.util.LinkedHashMap;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.zip.CRC32;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+          import java.util.zip.ZipOutputStream;
+
+          /**
+           * Turns the blank template APK into a new, unsigned APK.
+           *
+           * The template's package name and label are fixed-length placeholders, so they can be
+           * overwritten byte-for-byte inside the binary manifest without rewriting its structure.
+           * The icon PNG, assets/config.txt and assets/www/* are swapped, signatures are dropped and
+           * everything is re-zipped uncompressed and 4-byte aligned (required for resources.arsc).
+           */
+          public final class ApkPatcher {
+
+              /** Must match applicationId in template/build.gradle.kts (25 chars). */
+              public static final String PKG_PLACEHOLDER = "com.w2a.xpppppppppppppppp";
+              /** Must match android:label in the template manifest (32 chars). */
+              public static final String LABEL_PLACEHOLDER = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW";
+
+              private static final int LABEL_LEN = 32;
+              private static final long FIXED_TIME = 1262304000000L; // 2010-01-01
+
+              private ApkPatcher() {
+              }
+
+              public static void build(File templateApk, OutputStream out, String packageName, String label,
+                                       byte[] iconPng, String config, Map<String, byte[]> wwwFiles) throws IOException {
+                  if (packageName.length() != PKG_PLACEHOLDER.length()) {
+                      throw new IOException("Package name must be exactly " + PKG_PLACEHOLDER.length() + " characters");
+                  }
+
+                  Map<String, byte[]> entries = readZip(templateApk);
+
+                  // Remove old signatures and any content from a previous build
+                  Iterator<String> it = entries.keySet().iterator();
+                  while (it.hasNext()) {
+                      String n = it.next();
+                      if (n.regionMatches(true, 0, "META-INF/", 0, 9)
+                              || n.equals("assets/config.txt")
+                              || n.startsWith("assets/www/")) {
+                          it.remove();
+                      }
+                  }
+
+                  byte[] manifest = entries.get("AndroidManifest.xml");
+                  if (manifest == null) throw new IOException("Template has no AndroidManifest.xml");
+                  patchManifest(manifest, packageName, label);
+
+                  byte[] arsc = entries.get("resources.arsc");
+                  if (arsc != null) replaceBoth(arsc, PKG_PLACEHOLDER, packageName);
+
+                  if (iconPng != null) {
+                      for (Map.Entry<String, byte[]> e : entries.entrySet()) {
+                          String k = e.getKey();
+                          if (k.startsWith("res/") && k.toLowerCase(Locale.ROOT).endsWith(".png")) {
+                              e.setValue(iconPng);
+                          }
+                      }
+                  }
+
+                  entries.put("assets/config.txt", config.getBytes(StandardCharsets.UTF_8));
+                  for (Map.Entry<String, byte[]> f : wwwFiles.entrySet()) {
+                      entries.put("assets/www/" + f.getKey(), f.getValue());
+                  }
+
+                  writeAligned(entries, out);
+              }
+
+              // ---------------------------------------------------------------- manifest
+
+              private static void patchManifest(byte[] m, String pkg, String label) throws IOException {
+                  if (replaceBoth(m, PKG_PLACEHOLDER, pkg) == 0) {
+                      throw new IOException("Package placeholder not found in template manifest");
+                  }
+                  byte[] u16 = LABEL_PLACEHOLDER.getBytes(StandardCharsets.UTF_16LE);
+                  if (indexOf(m, u16, 0) >= 0) {
+                      replaceAll(m, u16, padLabel(label, true).getBytes(StandardCharsets.UTF_16LE));
+                      return;
+                  }
+                  byte[] u8 = LABEL_PLACEHOLDER.getBytes(StandardCharsets.US_ASCII);
+                  if (indexOf(m, u8, 0) >= 0) {
+                      // UTF-8 string pool: keep the byte length identical, so ASCII only
+                      replaceAll(m, u8, padLabel(label, false).getBytes(StandardCharsets.US_ASCII));
+                      return;
+                  }
+                  throw new IOException("Label placeholder not found in template manifest");
+              }
+
+              /** Returns exactly 32 chars: the name centered and padded with spaces. */
+              static String padLabel(String name, boolean unicode) {
+                  String s = name == null ? "" : name.trim();
+                  if (!unicode) {
+                      s = Normalizer.normalize(s, Normalizer.Form.NFD).replaceAll("[^\\x20-\\x7E]", "");
+                  }
+                  s = s.replaceAll("\\p{Cntrl}", " ").trim();
+                  if (s.isEmpty()) s = "App";
+                  if (s.length() > LABEL_LEN) {
+                      s = s.substring(0, LABEL_LEN);
+                      if (Character.isHighSurrogate(s.charAt(s.length() - 1))) {
+                          s = s.substring(0, s.length() - 1);
+                      }
+                  }
+                  int total = LABEL_LEN - s.length();
+                  int left = total / 2;
+                  int right = total - left;
+                  StringBuilder sb = new StringBuilder(LABEL_LEN);
+                  for (int i = 0; i < left; i++) sb.append(' ');
+                  sb.append(s);
+                  for (int i = 0; i < right; i++) sb.append(' ');
+                  return sb.toString();
+              }
+
+              // ---------------------------------------------------------------- byte helpers
+
+              private static int replaceBoth(byte[] data, String from, String to) throws IOException {
+                  int n = replaceAll(data, from.getBytes(StandardCharsets.UTF_16LE), to.getBytes(StandardCharsets.UTF_16LE));
+                  n += replaceAll(data, from.getBytes(StandardCharsets.UTF_8), to.getBytes(StandardCharsets.UTF_8));
+                  return n;
+              }
+
+              private static int replaceAll(byte[] data, byte[] find, byte[] repl) throws IOException {
+                  if (find.length != repl.length) throw new IOException("Replacement length mismatch");
+                  int count = 0;
+                  int pos = 0;
+                  while ((pos = indexOf(data, find, pos)) >= 0) {
+                      System.arraycopy(repl, 0, data, pos, repl.length);
+                      pos += repl.length;
+                      count++;
+                  }
+                  return count;
+              }
+
+              private static int indexOf(byte[] data, byte[] find, int from) {
+                  outer:
+                  for (int i = from; i <= data.length - find.length; i++) {
+                      for (int j = 0; j < find.length; j++) {
+                          if (data[i + j] != find[j]) continue outer;
+                      }
+                      return i;
+                  }
+                  return -1;
+              }
+
+              // ---------------------------------------------------------------- zip in / out
+
+              private static Map<String, byte[]> readZip(File file) throws IOException {
+                  Map<String, byte[]> map = new LinkedHashMap<>();
+                  try (ZipFile zf = new ZipFile(file)) {
+                      Enumeration<? extends ZipEntry> en = zf.entries();
+                      while (en.hasMoreElements()) {
+                          ZipEntry e = en.nextElement();
+                          if (e.isDirectory()) continue;
+                          try (InputStream in = zf.getInputStream(e)) {
+                              ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                              byte[] buf = new byte[16384];
+                              int r;
+                              while ((r = in.read(buf)) > 0) bos.write(buf, 0, r);
+                              map.put(e.getName(), bos.toByteArray());
+                          }
+                      }
+                  }
+                  return map;
+              }
+
+              private static final class Counting extends FilterOutputStream {
+                  long count;
+
+                  Counting(OutputStream o) {
+                      super(o);
+                  }
+
+                  @Override
+                  public void write(int b) throws IOException {
+                      out.write(b);
+                      count++;
+                  }
+
+                  @Override
+                  public void write(byte[] b, int off, int len) throws IOException {
+                      out.write(b, off, len);
+                      count += len;
+                  }
+              }
+
+              /** Writes every entry STORED (uncompressed) with its data starting on a 4-byte boundary. */
+              private static void writeAligned(Map<String, byte[]> entries, OutputStream out) throws IOException {
+                  Counting counting = new Counting(out);
+                  ZipOutputStream zos = new ZipOutputStream(counting);
+                  for (Map.Entry<String, byte[]> e : entries.entrySet()) {
+                      String name = e.getKey();
+                      byte[] data = e.getValue();
+
+                      ZipEntry ze = new ZipEntry(name);
+                      ze.setMethod(ZipEntry.STORED);
+                      ze.setSize(data.length);
+                      ze.setCompressedSize(data.length);
+                      CRC32 crc = new CRC32();
+                      crc.update(data, 0, data.length);
+                      ze.setCrc(crc.getValue());
+                      ze.setTime(FIXED_TIME);
+
+                      long dataStart = counting.count + 30 + name.getBytes(StandardCharsets.UTF_8).length;
+                      int pad = (int) ((4 - (dataStart % 4)) % 4);
+                      if (pad != 0) {
+                          int len = pad + 4; // an extra field needs at least 4 bytes (id + size)
+                          byte[] extra = new byte[len];
+                          extra[0] = 0x35;
+                          extra[1] = (byte) 0xD9; // 0xD935: the id zipalign uses for padding
+                          extra[2] = (byte) (len - 4);
+                          ze.setExtra(extra);
+                      }
+
+                      zos.putNextEntry(ze);
+                      zos.write(data, 0, data.length);
+                      zos.closeEntry();
+                  }
+                  zos.finish();
+                  zos.flush();
+              }
+          }
+          EOF
+
+          cat > $P/builder/src/main/java/com/web2apk/builder/IconMaker.java <<'EOF'
+          package com.web2apk.builder;
+
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.graphics.Typeface;
+
+          import java.io.ByteArrayOutputStream;
+
+          /** Draws a simple launcher icon: a colored rounded square with the app's first letter. */
+          final class IconMaker {
+
+              private IconMaker() {
+              }
+
+              static byte[] make(String name, int seed) {
+                  int size = 192;
+                  Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+                  Canvas canvas = new Canvas(bmp);
+
+                  float hue = Math.abs(seed % 360);
+                  Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  bg.setColor(Color.HSVToColor(new float[]{hue, 0.65f, 0.80f}));
+                  canvas.drawRoundRect(new RectF(0, 0, size, size), 44f, 44f, bg);
+
+                  String letter = "W";
+                  String t = name == null ? "" : name.trim();
+                  if (!t.isEmpty()) {
+                      int cp = Character.toUpperCase(t.codePointAt(0));
+                      letter = new String(Character.toChars(cp));
+                  }
+
+                  Paint fg = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  fg.setColor(Color.WHITE);
+                  fg.setTextAlign(Paint.Align.CENTER);
+                  fg.setTextSize(110f);
+                  fg.setTypeface(Typeface.DEFAULT_BOLD);
+                  Paint.FontMetrics fm = fg.getFontMetrics();
+                  float y = size / 2f - (fm.ascent + fm.descent) / 2f;
+                  canvas.drawText(letter, size / 2f, y, fg);
+
+                  ByteArrayOutputStream out = new ByteArrayOutputStream();
+                  bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
+                  bmp.recycle();
+                  return out.toByteArray();
+              }
+          }
+          EOF
+
+          cat > $P/builder/src/main/java/com/web2apk/builder/MainActivity.java <<'EOF'
+          package com.web2apk.builder;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.OpenableColumns;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.RadioButton;
+          import android.widget.RadioGroup;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import androidx.core.content.FileProvider;
+
+          import java.io.BufferedOutputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.security.MessageDigest;
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+
+          public class MainActivity extends Activity {
+
+              private static final int REQ_PICK = 1;
+              private static final long MAX_BYTES = 64L * 1024 * 1024;
+
+              private EditText nameInput;
+              private EditText urlInput;
+              private RadioButton linkRadio;
+              private LinearLayout linkBox;
+              private LinearLayout fileBox;
+              private LinearLayout resultBox;
+              private TextView pickedText;
+              private TextView statusText;
+              private Button buildBtn;
+
+              private final List<Uri> picked = new ArrayList<>();
+              private File lastApk;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setTitle("Web2APK");
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(20);
+                  root.setPadding(pad, pad, pad, pad);
+                  scroll.addView(root, new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  setContentView(scroll);
+
+                  root.addView(heading("App name"));
+                  nameInput = new EditText(this);
+                  nameInput.setHint("My App");
+                  nameInput.setSingleLine(true);
+                  root.addView(nameInput);
+
+                  root.addView(heading("Make the app from"));
+                  RadioGroup group = new RadioGroup(this);
+                  group.setOrientation(RadioGroup.VERTICAL);
+                  linkRadio = new RadioButton(this);
+                  linkRadio.setText("A website link");
+                  linkRadio.setId(View.generateViewId());
+                  RadioButton fileRadio = new RadioButton(this);
+                  fileRadio.setText("Local HTML file(s) from this phone");
+                  fileRadio.setId(View.generateViewId());
+                  group.addView(linkRadio);
+                  group.addView(fileRadio);
+                  root.addView(group);
+
+                  linkBox = new LinearLayout(this);
+                  linkBox.setOrientation(LinearLayout.VERTICAL);
+                  urlInput = new EditText(this);
+                  urlInput.setHint("https://example.com");
+                  urlInput.setSingleLine(true);
+                  urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+                  linkBox.addView(urlInput);
+                  root.addView(linkBox);
+
+                  fileBox = new LinearLayout(this);
+                  fileBox.setOrientation(LinearLayout.VERTICAL);
+                  Button pickBtn = new Button(this);
+                  pickBtn.setText("Choose HTML file(s)");
+                  pickBtn.setOnClickListener(v -> pickFiles());
+                  pickedText = new TextView(this);
+                  pickedText.setText("Nothing chosen yet. Pick your .html file, plus any .css/.js/images it uses.");
+                  fileBox.addView(pickBtn);
+                  fileBox.addView(pickedText);
+                  root.addView(fileBox);
+
+                  buildBtn = new Button(this);
+                  buildBtn.setText("Build APK");
+                  buildBtn.setOnClickListener(v -> startBuild());
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = dp(16);
+                  root.addView(buildBtn, lp);
+
+                  statusText = new TextView(this);
+                  statusText.setPadding(0, dp(12), 0, dp(12));
+                  root.addView(statusText);
+
+                  resultBox = new LinearLayout(this);
+                  resultBox.setOrientation(LinearLayout.VERTICAL);
+                  resultBox.setVisibility(View.GONE);
+                  Button installBtn = new Button(this);
+                  installBtn.setText("Install");
+                  installBtn.setOnClickListener(v -> installApk());
+                  Button shareBtn = new Button(this);
+                  shareBtn.setText("Share / save APK");
+                  shareBtn.setOnClickListener(v -> shareApk());
+                  resultBox.addView(installBtn);
+                  resultBox.addView(shareBtn);
+                  root.addView(resultBox);
+
+                  group.setOnCheckedChangeListener((g, id) -> updateMode());
+                  linkRadio.setChecked(true);
+                  updateMode();
+              }
+
+              // ------------------------------------------------------------------ UI helpers
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private TextView heading(String text) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextSize(16f);
+                  t.setPadding(0, dp(16), 0, dp(4));
+                  return t;
+              }
+
+              private void toast(String msg) {
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+              }
+
+              private void updateMode() {
+                  boolean link = linkRadio.isChecked();
+                  linkBox.setVisibility(link ? View.VISIBLE : View.GONE);
+                  fileBox.setVisibility(link ? View.GONE : View.VISIBLE);
+              }
+
+              // ------------------------------------------------------------------ picking files
+
+              private void pickFiles() {
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("*/*");
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                  startActivityForResult(i, REQ_PICK);
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode != REQ_PICK || resultCode != RESULT_OK || data == null) return;
+
+                  picked.clear();
+                  ClipData clip = data.getClipData();
+                  if (clip != null) {
+                      for (int n = 0; n < clip.getItemCount(); n++) picked.add(clip.getItemAt(n).getUri());
+                  } else if (data.getData() != null) {
+                      picked.add(data.getData());
+                  }
+
+                  StringBuilder sb = new StringBuilder();
+                  for (Uri u : picked) {
+                      try {
+                          getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      } catch (Exception ignored) {
+                      }
+                      sb.append("• ").append(displayName(u)).append('\n');
+                  }
+                  pickedText.setText(picked.isEmpty() ? "Nothing chosen yet." : sb.toString().trim());
+              }
+
+              private String displayName(Uri uri) {
+                  String name = null;
+                  try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                      if (c != null && c.moveToFirst()) name = c.getString(0);
+                  } catch (Exception ignored) {
+                  }
+                  if (name == null || name.isEmpty()) {
+                      name = uri.getLastPathSegment();
+                      if (name == null || name.isEmpty()) name = "file";
+                  }
+                  return name.replace('/', '_').replace('\\', '_');
+              }
+
+              private byte[] readAll(Uri uri) throws IOException {
+                  try (InputStream in = getContentResolver().openInputStream(uri)) {
+                      if (in == null) throw new IOException("Cannot open " + uri);
+                      ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                      byte[] buf = new byte[16384];
+                      int r;
+                      while ((r = in.read(buf)) > 0) bos.write(buf, 0, r);
+                      return bos.toByteArray();
+                  }
+              }
+
+              // ------------------------------------------------------------------ building
+
+              private void startBuild() {
+                  final String name = nameInput.getText().toString().trim();
+                  if (name.isEmpty()) {
+                      toast("Enter an app name");
+                      return;
+                  }
+                  final boolean link = linkRadio.isChecked();
+                  final String url = urlInput.getText().toString().trim();
+                  if (link && url.isEmpty()) {
+                      toast("Enter a website link");
+                      return;
+                  }
+                  if (!link && picked.isEmpty()) {
+                      toast("Choose an HTML file first");
+                      return;
+                  }
+                  final List<Uri> uris = new ArrayList<>(picked);
+
+                  buildBtn.setEnabled(false);
+                  resultBox.setVisibility(View.GONE);
+                  statusText.setText("Building… this takes a few seconds.");
+
+                  new Thread(() -> {
+                      try {
+                          File apk = doBuild(name, link, url, uris);
+                          runOnUiThread(() -> onBuilt(apk));
+                      } catch (Throwable t) {
+                          runOnUiThread(() -> onFailed(t));
+                      }
+                  }).start();
+              }
+
+              private File doBuild(String name, boolean link, String url, List<Uri> uris) throws Exception {
+                  String config;
+                  Map<String, byte[]> www = new LinkedHashMap<>();
+
+                  if (link) {
+                      String u = url;
+                      if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u;
+                      config = "URL=" + u;
+                  } else {
+                      String entry = null;
+                      long total = 0;
+                      for (Uri uri : uris) {
+                          String fname = displayName(uri);
+                          byte[] data = readAll(uri);
+                          total += data.length;
+                          if (total > MAX_BYTES) throw new IOException("Files are too large (limit 64 MB)");
+                          www.put(fname, data);
+                          String low = fname.toLowerCase(Locale.ROOT);
+                          if (low.endsWith(".html") || low.endsWith(".htm")) {
+                              if (entry == null || low.startsWith("index.")) entry = fname;
+                          }
+                      }
+                      if (entry == null) throw new IOException("Please choose at least one .html file");
+                      config = "FILE=" + entry;
+                  }
+
+                  // Same name + same source => same package name, so rebuilding updates the installed app
+                  String pkg = "com.w2a.x" + hash16(name + "|" + config);
+
+                  File dir = new File(getCacheDir(), "apks");
+                  if (!dir.exists()) dir.mkdirs();
+                  File[] old = dir.listFiles();
+                  if (old != null) for (File f : old) f.delete();
+
+                  File template = new File(dir, "template.tmp");
+                  try (InputStream in = getAssets().open("template.apk");
+                       OutputStream out = new FileOutputStream(template)) {
+                      byte[] buf = new byte[16384];
+                      int r;
+                      while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
+                  }
+
+                  File unsigned = new File(dir, "unsigned.tmp");
+                  try (OutputStream out = new BufferedOutputStream(new FileOutputStream(unsigned))) {
+                      ApkPatcher.build(template, out, pkg, name, IconMaker.make(name, pkg.hashCode()), config, www);
+                  }
+
+                  File signed = new File(dir, safeFileName(name) + ".apk");
+                  Signer.sign(unsigned, signed);
+                  template.delete();
+                  unsigned.delete();
+                  return signed;
+              }
+
+              private static String hash16(String s) throws Exception {
+                  byte[] d = MessageDigest.getInstance("SHA-256").digest(s.getBytes("UTF-8"));
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < 8; i++) sb.append(String.format("%02x", d[i]));
+                  return sb.toString();
+              }
+
+              private static String safeFileName(String name) {
+                  String s = name.replaceAll("[^A-Za-z0-9._-]", "_");
+                  return s.isEmpty() ? "app" : s;
+              }
+
+              private void onBuilt(File apk) {
+                  lastApk = apk;
+                  buildBtn.setEnabled(true);
+                  statusText.setText("Done: " + apk.getName() + " (" + (apk.length() / 1024) + " KB)");
+                  resultBox.setVisibility(View.VISIBLE);
+              }
+
+              private void onFailed(Throwable t) {
+                  buildBtn.setEnabled(true);
+                  String msg = String.valueOf(t);
+                  if (t.getCause() != null) msg += "\n" + t.getCause();
+                  statusText.setText("Build failed:\n" + msg);
+              }
+
+              // ------------------------------------------------------------------ install / share
+
+              private Uri apkUri() {
+                  return FileProvider.getUriForFile(this, "com.web2apk.builder.files", lastApk);
+              }
+
+              private void installApk() {
+                  if (lastApk == null) return;
+                  if (!getPackageManager().canRequestPackageInstalls()) {
+                      toast("Allow installs from Web2APK, then come back and tap Install again");
+                      startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                              Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  Intent i = new Intent(Intent.ACTION_VIEW);
+                  i.setDataAndType(apkUri(), "application/vnd.android.package-archive");
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  startActivity(i);
+              }
+
+              private void shareApk() {
+                  if (lastApk == null) return;
+                  Intent i = new Intent(Intent.ACTION_SEND);
+                  i.setType("application/vnd.android.package-archive");
+                  i.putExtra(Intent.EXTRA_STREAM, apkUri());
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  startActivity(Intent.createChooser(i, "Share APK"));
+              }
+          }
+          EOF
+
+          cat > $P/builder/src/main/java/com/web2apk/builder/Signer.java <<'EOF'
+          package com.web2apk.builder;
+
+          import android.security.keystore.KeyGenParameterSpec;
+          import android.security.keystore.KeyProperties;
+
+          import com.android.apksig.ApkSigner;
+
+          import java.io.File;
+          import java.math.BigInteger;
+          import java.security.KeyPairGenerator;
+          import java.security.KeyStore;
+          import java.security.PrivateKey;
+          import java.security.cert.Certificate;
+          import java.security.cert.X509Certificate;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Date;
+          import java.util.List;
+
+          import javax.security.auth.x500.X500Principal;
+
+          /**
+           * Signs APKs with a key that lives in the Android Keystore of this phone.
+           * The same key is reused for every app, so rebuilding an app updates the installed one.
+           */
+          final class Signer {
+
+              private static final String ALIAS = "web2apk_signing_key";
+
+              private Signer() {
+              }
+
+              static void sign(File unsignedApk, File signedApk) throws Exception {
+                  KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
+                  ks.load(null);
+
+                  if (!ks.containsAlias(ALIAS)) {
+                      KeyPairGenerator kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore");
+                      kpg.initialize(new KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_SIGN)
+                              .setKeySize(2048)
+                              .setDigests(KeyProperties.DIGEST_SHA256)
+                              .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+                              .setCertificateSubject(new X500Principal("CN=Web2APK"))
+                              .setCertificateSerialNumber(BigInteger.ONE)
+                              .setCertificateNotBefore(new Date(System.currentTimeMillis() - 86400000L))
+                              .setCertificateNotAfter(new Date(2208988800000L)) // 2040-01-01
+                              .build());
+                      kpg.generateKeyPair();
+                  }
+
+                  PrivateKey key = (PrivateKey) ks.getKey(ALIAS, null);
+                  Certificate[] chain = ks.getCertificateChain(ALIAS);
+                  List<X509Certificate> certs = new ArrayList<>();
+                  for (Certificate c : chain) certs.add((X509Certificate) c);
+
+                  ApkSigner.SignerConfig cfg = new ApkSigner.SignerConfig.Builder("web2apk", key, certs).build();
+                  ApkSigner signer = new ApkSigner.Builder(Collections.singletonList(cfg))
+                          .setInputApk(unsignedApk)
+                          .setOutputApk(signedApk)
+                          .setMinSdkVersion(24)
+                          .setV1SigningEnabled(false)
+                          .setV2SigningEnabled(true)
+                          .setV3SigningEnabled(false)
+                          .build();
+                  signer.sign();
+              }
+          }
+          EOF
+
+          cat > $P/builder/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#2563EB"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="5"
+                  android:pathData="M54,24a30,30 0 1,0 0.001,0z" />
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="5"
+                  android:pathData="M24,54h60 M54,24c-16,16 -16,44 0,60 M54,24c16,16 16,44 0,60" />
+          </vector>
+          EOF
+
+          cat > $P/builder/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="apks" path="apks/" />
+          </paths>
+          EOF
+
+          cat > $P/template/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+          }
+
+          // This module is the "blank" web app. The builder app embeds its APK and, on the phone,
+          // swaps in the package name, label, icon and web content (see ApkPatcher.java).
+          android {
+              namespace = "com.web2apk.template"
+              compileSdk = 34
+
+              defaultConfig {
+                  // Placeholder: must stay exactly 25 characters (ApkPatcher.PKG_PLACEHOLDER)
+                  applicationId = "com.w2a.xpppppppppppppppp"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures {
+                  buildConfig = false
+              }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > $P/template/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <!-- The label is a 32-character placeholder that the builder app overwrites in place. -->
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name="com.web2apk.template.MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $P/template/src/main/java/com/web2apk/template/MainActivity.java <<'EOF'
+          package com.web2apk.template;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends Activity {
+
+              private WebView webView;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(true);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+                  s.setUseWideViewPort(true);
+                  s.setLoadWithOverviewMode(true);
+
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          String scheme = request.getUrl().getScheme();
+                          if (scheme == null || scheme.equals("http") || scheme.equals("https") || scheme.equals("file")) {
+                              return false;
+                          }
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, request.getUrl()));
+                          } catch (Exception ignored) {
+                          }
+                          return true;
+                      }
+                  });
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState);
+                  } else {
+                      webView.loadUrl(resolveStartUrl());
+                  }
+              }
+
+              // assets/config.txt is written by the builder app: "URL=https://..." or "FILE=page.html"
+              private String resolveStartUrl() {
+                  String cfg = "";
+                  try (InputStream in = getAssets().open("config.txt");
+                       BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                      String line = r.readLine();
+                      if (line != null) cfg = line.trim();
+                  } catch (Exception ignored) {
+                  }
+                  if (cfg.startsWith("URL=")) {
+                      String u = cfg.substring(4).trim();
+                      if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u;
+                      return u;
+                  }
+                  if (cfg.startsWith("FILE=")) {
+                      return "file:///android_asset/www/" + Uri.encode(cfg.substring(5).trim());
+                  }
+                  return "file:///android_asset/www/index.html";
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  webView.saveState(outState);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  webView.destroy();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          base64 -d > $P/template/src/main/res/drawable-nodpi/ic_launcher.png <<'EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAIAAABt+uBvAAAAjklEQVR42u3QMQ0AAAgDsPnCHaK5ccDJ1aQKmurhEAWCBAkSJEiQIEEIEiRIkCBBggQhSJAgQYIECRKEIEGCBAkSJEiQIAQJEiRIkCBBghAkSJAgQYIECUKQIEGCBAkSJEgQggQJEiRIkCBBCBIkSJAgQYIEIUiQIEGCBAkSJAhBggQJEiRIkCAECRL0ZwGjeC+U2MUH6wAAAABJRU5ErkJggg==
+          EOF
+
+      - name: Build app
+        working-directory: _proj
+        run: gradle :builder:assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Web2APK-app
+          path: _proj/builder/build/outputs/apk/debug/*.apk
