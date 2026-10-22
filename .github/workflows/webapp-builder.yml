@@ -1,0 +1,287 @@
+name: WebApp Builder Android App
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build the Builder app, or build an app requested by it
+        type: choice
+        options: [builder_app, website_apk]
+        default: builder_app
+        required: true
+      app_name:
+        description: Target app name
+        type: string
+        default: My Web App
+        required: true
+      package_id:
+        description: Target package ID
+        type: string
+        default: com.example.webapp
+        required: true
+      source_type:
+        description: Website URL or direct HTML URL
+        type: choice
+        options: [url, html_url]
+        default: url
+        required: true
+      source_url:
+        description: Website URL or direct HTTPS URL to an HTML file
+        type: string
+        default: https://example.com
+        required: true
+      icon_url:
+        description: Optional direct HTTPS URL to a PNG icon
+        type: string
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Generate app source
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_ID: ${{ inputs.package_id }}
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == "builder_app" ]]; then
+            APP_NAME="WebApp Builder"
+            PACKAGE_ID="com.generated.webappbuilder"
+          else
+            [[ "$PACKAGE_ID" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || { echo "Invalid package ID"; exit 1; }
+            [[ "$SOURCE_URL" =~ ^https?:// ]] || { echo "Source URL must start with http(s)://"; exit 1; }
+          fi
+          export APP_NAME PACKAGE_ID MODE SOURCE_TYPE SOURCE_URL ICON_URL
+          PKG_PATH="${PACKAGE_ID//./\/}"
+          mkdir -p "app/src/main/java/$PKG_PATH" app/src/main/res/drawable app/src/main/assets
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "GeneratedAndroidApp"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+
+          echo 'org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8' > gradle.properties
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace System.getenv("PACKAGE_ID")
+              compileSdk 35
+              defaultConfig {
+                  applicationId System.getenv("PACKAGE_ID")
+                  minSdk 23
+                  targetSdk 28
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF
+
+          python3 <<'PY'
+          import os
+          from xml.sax.saxutils import escape
+          name = escape(os.environ["APP_NAME"], {'"': '&quot;', "'": '&apos;'})
+          manifest = f'''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application android:label="{name}" android:icon="@drawable/app_icon"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>'''
+          open("app/src/main/AndroidManifest.xml", "w").write(manifest)
+          PY
+
+          cat > app/src/main/res/drawable/app_icon.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
+              <path android:fillColor="#2563EB" android:pathData="M0,0h48v48h-48z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M10,12h28v4h-28zM10,22h28v4h-28zM10,32h20v4h-20z"/>
+          </vector>
+          EOF
+
+          if [[ "$MODE" == "website_apk" ]]; then
+            if [[ "$SOURCE_TYPE" == "url" ]]; then
+              printf '%s' "$SOURCE_URL" > app/src/main/assets/start_url.txt
+            else
+              curl --fail --location --silent --show-error --max-time 30 "$SOURCE_URL" -o app/src/main/assets/index.html
+            fi
+            if [[ -n "$ICON_URL" ]]; then
+              curl --fail --location --silent --show-error --max-time 30 "$ICON_URL" -o /tmp/app_icon.png
+              file /tmp/app_icon.png | grep -qi 'PNG image' || { echo "Icon URL must return PNG"; exit 1; }
+              rm app/src/main/res/drawable/app_icon.xml
+              mkdir -p app/src/main/res/drawable-nodpi
+              cp /tmp/app_icon.png app/src/main/res/drawable-nodpi/app_icon.png
+            fi
+            cat > "app/src/main/java/$PKG_PATH/MainActivity.java" <<EOF
+          package $PACKAGE_ID;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          public class MainActivity extends Activity {
+              private WebView web;
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  web = new WebView(this); setContentView(web);
+                  web.getSettings().setJavaScriptEnabled(true);
+                  web.getSettings().setDomStorageEnabled(true);
+                  web.setWebViewClient(new WebViewClient());
+                  web.setWebChromeClient(new WebChromeClient());
+                  try {
+                      BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("start_url.txt"), "UTF-8"));
+                      String url = r.readLine(); r.close(); web.loadUrl(url);
+                  } catch (Exception e) { web.loadUrl("file:///android_asset/index.html"); }
+              }
+              @Override public void onBackPressed() {
+                  if (web != null && web.canGoBack()) web.goBack(); else super.onBackPressed();
+              }
+          }
+          EOF
+          else
+            cat > "app/src/main/java/$PKG_PATH/MainActivity.java" <<'JAVA'
+          package com.generated.webappbuilder;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Color;
+          import android.text.InputType;
+          import android.widget.*;
+          import org.json.JSONObject;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          public class MainActivity extends Activity {
+              EditText token, repo, branch, name, pkg, source, icon;
+              RadioGroup kind;
+              TextView status;
+              Button build;
+              EditText field(LinearLayout box, String hint, String value, int type) {
+                  EditText e = new EditText(this); e.setHint(hint); e.setText(value);
+                  e.setSingleLine(true); e.setInputType(type); box.addView(e); return e;
+              }
+              public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout box = new LinearLayout(this); box.setOrientation(1);
+                  box.setPadding(32,32,32,32); box.setBackgroundColor(Color.WHITE); scroll.addView(box);
+                  TextView title = new TextView(this); title.setText("WebApp Builder"); title.setTextSize(28);
+                  title.setTextColor(Color.rgb(37,99,235)); box.addView(title);
+                  TextView desc = new TextView(this); desc.setText("Create an APK from a website or HTML URL. GitHub Actions builds it."); box.addView(desc);
+                  token = field(box,"GitHub token (workflow permission)","",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  repo = field(box,"GitHub repository owner/repo","",InputType.TYPE_CLASS_TEXT);
+                  branch = field(box,"Workflow branch","main",InputType.TYPE_CLASS_TEXT);
+                  name = field(box,"App name","My Web App",InputType.TYPE_CLASS_TEXT);
+                  pkg = field(box,"Package ID","com.example.webapp",InputType.TYPE_CLASS_TEXT);
+                  kind = new RadioGroup(this); kind.setOrientation(RadioGroup.HORIZONTAL);
+                  RadioButton url = new RadioButton(this); url.setText("Website URL"); url.setId(1);
+                  RadioButton html = new RadioButton(this); html.setText("HTML URL"); html.setId(2);
+                  kind.addView(url); kind.addView(html); url.setChecked(true); box.addView(kind);
+                  source = field(box,"https://example.com","https://example.com",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_URI);
+                  icon = field(box,"Optional direct PNG icon URL","",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_URI);
+                  status = new TextView(this); status.setText("Enter GitHub details to start a build."); box.addView(status);
+                  build = new Button(this); build.setText("Create APK"); box.addView(build);
+                  build.setOnClickListener(v -> dispatch());
+                  setContentView(scroll);
+              }
+              void dispatch() {
+                  final String t=token.getText().toString().trim(), r=repo.getText().toString().trim();
+                  final String br=branch.getText().toString().trim(), n=name.getText().toString().trim();
+                  final String p=pkg.getText().toString().trim(), s=source.getText().toString().trim(), i=icon.getText().toString().trim();
+                  if(t.isEmpty() || !r.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+") || br.isEmpty() || n.isEmpty() || s.isEmpty()) {
+                      status.setText("Fill in token, repository, branch, app name and source URL."); return;
+                  }
+                  if(!p.matches("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+")) {
+                      status.setText("Invalid package ID, e.g. com.example.myapp"); return;
+                  }
+                  build.setEnabled(false); status.setText("Starting GitHub Actions…");
+                  new Thread(() -> {
+                      HttpURLConnection c=null;
+                      try {
+                          String[] parts=r.split("/");
+                          URL u=new URL("https://api.github.com/repos/"+parts[0]+"/"+parts[1]+"/actions/workflows/webapp-builder.yml/dispatches");
+                          c=(HttpURLConnection)u.openConnection(); c.setRequestMethod("POST");
+                          c.setConnectTimeout(15000); c.setReadTimeout(15000); c.setDoOutput(true);
+                          c.setRequestProperty("Authorization","Bearer "+t);
+                          c.setRequestProperty("Accept","application/vnd.github+json");
+                          c.setRequestProperty("X-GitHub-Api-Version","2022-11-28");
+                          c.setRequestProperty("Content-Type","application/json");
+                          JSONObject inputs=new JSONObject(); inputs.put("mode","website_apk");
+                          inputs.put("app_name",n); inputs.put("package_id",p);
+                          inputs.put("source_type",kind.getCheckedRadioButtonId()==2?"html_url":"url");
+                          inputs.put("source_url",s); inputs.put("icon_url",i);
+                          JSONObject body=new JSONObject(); body.put("ref",br); body.put("inputs",inputs);
+                          try(OutputStream out=c.getOutputStream()){out.write(body.toString().getBytes("UTF-8"));}
+                          int code=c.getResponseCode();
+                          runOnUiThread(() -> {
+                              status.setText(code==204 ? "Build started! Open GitHub → Actions in "+r+" to download the APK." :
+                                  "GitHub returned HTTP "+code+". Check token permissions, repository and workflow filename.");
+                              build.setEnabled(true);
+                          });
+                      } catch(Exception e) {
+                          runOnUiThread(() -> {status.setText("Could not start build: "+e.getMessage()); build.setEnabled(true);});
+                      } finally { if(c!=null)c.disconnect(); }
+                  }).start();
+              }
+          }
+          JAVA
+          fi
+
+      - name: Compile APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+          /tmp/gradle-8.9/bin/gradle --no-daemon assembleDebug
+
+      - name: Name output
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          if [[ "$MODE" == "builder_app" ]]; then NAME="WebApp-Builder"; else NAME="$(printf '%s' "$APP_NAME" | tr -cs 'A-Za-z0-9._-' '_')"; fi
+          cp app/build/outputs/apk/debug/app-debug.apk "app/build/outputs/apk/debug/${NAME}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.mode == 'builder_app' && 'webapp-builder-app' || 'generated-website-apk' }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
