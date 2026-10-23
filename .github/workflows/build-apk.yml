@@ -134,7 +134,8 @@ jobs:
                   <activity
                       android:name="com.web2apk.builder.MainActivity"
                       android:exported="true"
-                      android:windowSoftInputMode="adjustResize">
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -163,13 +164,18 @@ jobs:
           import java.io.IOException;
           import java.io.InputStream;
           import java.io.OutputStream;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
           import java.nio.charset.StandardCharsets;
-          import java.text.Normalizer;
+          import java.util.Arrays;
           import java.util.Enumeration;
+          import java.util.HashSet;
           import java.util.Iterator;
           import java.util.LinkedHashMap;
           import java.util.Locale;
           import java.util.Map;
+          import java.util.Set;
+          import java.util.regex.Pattern;
           import java.util.zip.CRC32;
           import java.util.zip.ZipEntry;
           import java.util.zip.ZipFile;
@@ -178,28 +184,55 @@ jobs:
           /**
            * Turns the blank template APK into a new, unsigned APK.
            *
-           * The template's package name and label are fixed-length placeholders, so they can be
-           * overwritten byte-for-byte inside the binary manifest without rewriting its structure.
-           * The icon PNG, assets/config.txt and assets/www/* are swapped, signatures are dropped and
-           * everything is re-zipped uncompressed and 4-byte aligned (required for resources.arsc).
+           * The template's package name and label are placeholder strings. The binary manifest's
+           * string table is rebuilt with the real values (any length, any characters), the icon PNG,
+           * assets/config.txt and assets/www/* are swapped, old signatures are dropped and everything
+           * is re-zipped uncompressed and 4-byte aligned (required for resources.arsc).
            */
           public final class ApkPatcher {
 
-              /** Must match applicationId in template/build.gradle.kts (25 chars). */
+              /** Must match applicationId in template/build.gradle.kts. */
               public static final String PKG_PLACEHOLDER = "com.w2a.xpppppppppppppppp";
-              /** Must match android:label in the template manifest (32 chars). */
+              /** Must match android:label in the template manifest. */
               public static final String LABEL_PLACEHOLDER = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW";
+              /** The builder's own id: a generated app must never use it (it would replace the builder). */
+              public static final String BUILDER_PACKAGE = "com.web2apk.builder";
 
-              private static final int LABEL_LEN = 32;
+              public static final int MAX_LABEL = 60;
+              public static final int MAX_PACKAGE = 120;
+
+              private static final Pattern PKG_PATTERN =
+                      Pattern.compile("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$");
               private static final long FIXED_TIME = 1262304000000L; // 2010-01-01
 
               private ApkPatcher() {
               }
 
+              /** At least two dot-separated segments, each starting with a letter (letters, digits, _). */
+              public static boolean isValidPackage(String s) {
+                  return s != null && s.length() <= MAX_PACKAGE && PKG_PATTERN.matcher(s).matches();
+              }
+
+              /** Trims, drops control characters, caps the length, never returns an empty label. */
+              public static String cleanLabel(String name) {
+                  String s = name == null ? "" : name.replaceAll("\\p{Cntrl}", " ").trim();
+                  if (s.length() > MAX_LABEL) {
+                      s = s.substring(0, MAX_LABEL);
+                      if (Character.isHighSurrogate(s.charAt(s.length() - 1))) {
+                          s = s.substring(0, s.length() - 1);
+                      }
+                      s = s.trim();
+                  }
+                  return s.isEmpty() ? "App" : s;
+              }
+
               public static void build(File templateApk, OutputStream out, String packageName, String label,
                                        byte[] iconPng, String config, Map<String, byte[]> wwwFiles) throws IOException {
-                  if (packageName.length() != PKG_PLACEHOLDER.length()) {
-                      throw new IOException("Package name must be exactly " + PKG_PLACEHOLDER.length() + " characters");
+                  if (!isValidPackage(packageName)) {
+                      throw new IOException("Invalid package name: " + packageName);
+                  }
+                  if (packageName.equals(BUILDER_PACKAGE)) {
+                      throw new IOException("That package name belongs to Web2APK itself");
                   }
 
                   Map<String, byte[]> entries = readZip(templateApk);
@@ -217,10 +250,16 @@ jobs:
 
                   byte[] manifest = entries.get("AndroidManifest.xml");
                   if (manifest == null) throw new IOException("Template has no AndroidManifest.xml");
-                  patchManifest(manifest, packageName, label);
+                  Map<String, String> repl = new LinkedHashMap<>();
+                  repl.put(PKG_PLACEHOLDER, packageName);
+                  repl.put(LABEL_PLACEHOLDER, cleanLabel(label));
+                  Set<String> found = new HashSet<>();
+                  entries.put("AndroidManifest.xml", rewriteXmlStrings(manifest, repl, found));
+                  if (!found.contains(PKG_PLACEHOLDER)) throw new IOException("Package placeholder not found in template");
+                  if (!found.contains(LABEL_PLACEHOLDER)) throw new IOException("Label placeholder not found in template");
 
                   byte[] arsc = entries.get("resources.arsc");
-                  if (arsc != null) replaceBoth(arsc, PKG_PLACEHOLDER, packageName);
+                  if (arsc != null) patchArscPackageName(arsc, PKG_PLACEHOLDER, packageName);
 
                   if (iconPng != null) {
                       for (Map.Entry<String, byte[]> e : entries.entrySet()) {
@@ -239,79 +278,176 @@ jobs:
                   writeAligned(entries, out);
               }
 
-              // ---------------------------------------------------------------- manifest
+              // ---------------------------------------------------------------- binary XML string pool
 
-              private static void patchManifest(byte[] m, String pkg, String label) throws IOException {
-                  if (replaceBoth(m, PKG_PLACEHOLDER, pkg) == 0) {
-                      throw new IOException("Package placeholder not found in template manifest");
-                  }
-                  byte[] u16 = LABEL_PLACEHOLDER.getBytes(StandardCharsets.UTF_16LE);
-                  if (indexOf(m, u16, 0) >= 0) {
-                      replaceAll(m, u16, padLabel(label, true).getBytes(StandardCharsets.UTF_16LE));
-                      return;
-                  }
-                  byte[] u8 = LABEL_PLACEHOLDER.getBytes(StandardCharsets.US_ASCII);
-                  if (indexOf(m, u8, 0) >= 0) {
-                      // UTF-8 string pool: keep the byte length identical, so ASCII only
-                      replaceAll(m, u8, padLabel(label, false).getBytes(StandardCharsets.US_ASCII));
-                      return;
-                  }
-                  throw new IOException("Label placeholder not found in template manifest");
+              private static int u16(byte[] d, int pos) {
+                  return (d[pos] & 0xFF) | ((d[pos + 1] & 0xFF) << 8);
               }
 
-              /** Returns exactly 32 chars: the name centered and padded with spaces. */
-              static String padLabel(String name, boolean unicode) {
-                  String s = name == null ? "" : name.trim();
-                  if (!unicode) {
-                      s = Normalizer.normalize(s, Normalizer.Form.NFD).replaceAll("[^\\x20-\\x7E]", "");
+              /**
+               * Rebuilds the string pool of a compiled (binary) XML file with the given substring
+               * replacements. Every string keeps its index, so the rest of the file stays valid.
+               * Keys that matched at least once are added to {@code found}.
+               */
+              public static byte[] rewriteXmlStrings(byte[] xml, Map<String, String> repl, Set<String> found)
+                      throws IOException {
+                  ByteBuffer b = ByteBuffer.wrap(xml).order(ByteOrder.LITTLE_ENDIAN);
+                  if (xml.length < 36 || u16(xml, 0) != 0x0003) throw new IOException("Manifest is not binary XML");
+                  int poolOff = u16(xml, 2);
+                  if (u16(xml, poolOff) != 0x0001) throw new IOException("String pool not found");
+                  int poolHdr = u16(xml, poolOff + 2);
+                  int poolSize = b.getInt(poolOff + 4);
+                  int count = b.getInt(poolOff + 8);
+                  int styleCount = b.getInt(poolOff + 12);
+                  int flags = b.getInt(poolOff + 16);
+                  int strStart = b.getInt(poolOff + 20);
+                  int styStart = b.getInt(poolOff + 24);
+                  boolean utf8 = (flags & 0x100) != 0;
+                  if (poolHdr < 28 || poolSize < poolHdr || poolOff + poolSize > xml.length
+                          || count < 0 || styleCount < 0
+                          || (long) poolHdr + 4L * count + 4L * styleCount > poolSize) {
+                      throw new IOException("Corrupt string pool");
                   }
-                  s = s.replaceAll("\\p{Cntrl}", " ").trim();
-                  if (s.isEmpty()) s = "App";
-                  if (s.length() > LABEL_LEN) {
-                      s = s.substring(0, LABEL_LEN);
-                      if (Character.isHighSurrogate(s.charAt(s.length() - 1))) {
-                          s = s.substring(0, s.length() - 1);
+                  int poolEnd = poolOff + poolSize;
+
+                  ByteArrayOutputStream strings = new ByteArrayOutputStream();
+                  int[] offsets = new int[count];
+                  for (int i = 0; i < count; i++) {
+                      int abs = poolOff + strStart + b.getInt(poolOff + poolHdr + 4 * i);
+                      if (abs < poolOff || abs + 2 > poolEnd) throw new IOException("Corrupt string offset");
+
+                      int rawLen;
+                      String s;
+                      if (utf8) {
+                          int p = 1;
+                          int n16 = xml[abs] & 0xFF;
+                          if ((n16 & 0x80) != 0) {
+                              n16 = ((n16 & 0x7F) << 8) | (xml[abs + 1] & 0xFF);
+                              p = 2;
+                          }
+                          int p2 = 1;
+                          int nb = xml[abs + p] & 0xFF;
+                          if ((nb & 0x80) != 0) {
+                              nb = ((nb & 0x7F) << 8) | (xml[abs + p + 1] & 0xFF);
+                              p2 = 2;
+                          }
+                          rawLen = p + p2 + nb + 1;
+                          if (abs + rawLen > poolEnd) throw new IOException("Corrupt string entry");
+                          s = new String(xml, abs + p + p2, nb, StandardCharsets.UTF_8);
+                      } else {
+                          int n = u16(xml, abs);
+                          int pre = 2;
+                          if ((n & 0x8000) != 0) {
+                              n = ((n & 0x7FFF) << 16) | u16(xml, abs + 2);
+                              pre = 4;
+                          }
+                          rawLen = pre + n * 2 + 2;
+                          if (abs + rawLen > poolEnd) throw new IOException("Corrupt string entry");
+                          s = new String(xml, abs + pre, n * 2, StandardCharsets.UTF_16LE);
+                      }
+
+                      String ns = s;
+                      for (Map.Entry<String, String> e : repl.entrySet()) {
+                          if (ns.contains(e.getKey())) {
+                              ns = ns.replace(e.getKey(), e.getValue());
+                              found.add(e.getKey());
+                          }
+                      }
+
+                      offsets[i] = strings.size();
+                      if (ns.equals(s)) {
+                          strings.write(xml, abs, rawLen); // untouched strings keep their exact bytes
+                      } else {
+                          byte[] enc = encodeString(ns, utf8);
+                          strings.write(enc, 0, enc.length);
                       }
                   }
-                  int total = LABEL_LEN - s.length();
-                  int left = total / 2;
-                  int right = total - left;
-                  StringBuilder sb = new StringBuilder(LABEL_LEN);
-                  for (int i = 0; i < left; i++) sb.append(' ');
-                  sb.append(s);
-                  for (int i = 0; i < right; i++) sb.append(' ');
-                  return sb.toString();
+                  while (strings.size() % 4 != 0) strings.write(0);
+                  byte[] stringData = strings.toByteArray();
+
+                  boolean hasStyles = styleCount > 0 && styStart > 0;
+                  byte[] styleData = hasStyles ? Arrays.copyOfRange(xml, poolOff + styStart, poolEnd) : new byte[0];
+
+                  int newStrStart = poolHdr + 4 * count + 4 * styleCount;
+                  int newStyStart = hasStyles ? newStrStart + stringData.length : 0;
+                  int newPoolSize = newStrStart + stringData.length + styleData.length;
+
+                  ByteBuffer p = ByteBuffer.allocate(newPoolSize).order(ByteOrder.LITTLE_ENDIAN);
+                  p.put(xml, poolOff, poolHdr);
+                  p.putInt(4, newPoolSize);
+                  p.putInt(20, newStrStart);
+                  p.putInt(24, newStyStart);
+                  p.position(poolHdr);
+                  for (int i = 0; i < count; i++) p.putInt(offsets[i]);
+                  if (styleCount > 0) p.put(xml, poolOff + poolHdr + 4 * count, 4 * styleCount);
+                  p.put(stringData);
+                  p.put(styleData);
+
+                  int declared = b.getInt(4);
+                  byte[] out = new byte[xml.length - poolSize + newPoolSize];
+                  System.arraycopy(xml, 0, out, 0, poolOff);
+                  System.arraycopy(p.array(), 0, out, poolOff, newPoolSize);
+                  System.arraycopy(xml, poolEnd, out, poolOff + newPoolSize, xml.length - poolEnd);
+                  ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN).putInt(4, declared - poolSize + newPoolSize);
+                  return out;
               }
 
-              // ---------------------------------------------------------------- byte helpers
-
-              private static int replaceBoth(byte[] data, String from, String to) throws IOException {
-                  int n = replaceAll(data, from.getBytes(StandardCharsets.UTF_16LE), to.getBytes(StandardCharsets.UTF_16LE));
-                  n += replaceAll(data, from.getBytes(StandardCharsets.UTF_8), to.getBytes(StandardCharsets.UTF_8));
-                  return n;
-              }
-
-              private static int replaceAll(byte[] data, byte[] find, byte[] repl) throws IOException {
-                  if (find.length != repl.length) throw new IOException("Replacement length mismatch");
-                  int count = 0;
-                  int pos = 0;
-                  while ((pos = indexOf(data, find, pos)) >= 0) {
-                      System.arraycopy(repl, 0, data, pos, repl.length);
-                      pos += repl.length;
-                      count++;
+              private static byte[] encodeString(String s, boolean utf8) throws IOException {
+                  ByteArrayOutputStream o = new ByteArrayOutputStream();
+                  if (utf8) {
+                      byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+                      if (s.length() > 0x7FFF || bytes.length > 0x7FFF) throw new IOException("String too long");
+                      writeLen8(o, s.length());
+                      writeLen8(o, bytes.length);
+                      o.write(bytes, 0, bytes.length);
+                      o.write(0);
+                  } else {
+                      int n = s.length();
+                      if (n > 0x7FFF) throw new IOException("String too long");
+                      o.write(n & 0xFF);
+                      o.write((n >>> 8) & 0xFF);
+                      byte[] chars = s.getBytes(StandardCharsets.UTF_16LE);
+                      o.write(chars, 0, chars.length);
+                      o.write(0);
+                      o.write(0);
                   }
-                  return count;
+                  return o.toByteArray();
               }
 
-              private static int indexOf(byte[] data, byte[] find, int from) {
-                  outer:
-                  for (int i = from; i <= data.length - find.length; i++) {
-                      for (int j = 0; j < find.length; j++) {
-                          if (data[i + j] != find[j]) continue outer;
+              private static void writeLen8(ByteArrayOutputStream o, int n) {
+                  if (n > 0x7F) {
+                      o.write(0x80 | (n >>> 8));
+                      o.write(n & 0xFF);
+                  } else {
+                      o.write(n);
+                  }
+              }
+
+              // ---------------------------------------------------------------- resources.arsc
+
+              /** Overwrites the (fixed-size, 128 char) package name field of each resource package. */
+              public static void patchArscPackageName(byte[] arsc, String oldName, String newName) {
+                  if (newName.length() > 127 || arsc.length < 12 || u16(arsc, 0) != 0x0002) return;
+                  ByteBuffer b = ByteBuffer.wrap(arsc).order(ByteOrder.LITTLE_ENDIAN);
+                  int off = u16(arsc, 2);
+                  int total = Math.min(b.getInt(4), arsc.length);
+                  while (off + 8 <= total) {
+                      int type = u16(arsc, off);
+                      int size = b.getInt(off + 4);
+                      if (size < 8 || off + size > total) break;
+                      if (type == 0x0200 && size >= 12 + 256) {
+                          int nameOff = off + 12;
+                          int len = 0;
+                          while (len < 128 && u16(arsc, nameOff + 2 * len) != 0) len++;
+                          String cur = new String(arsc, nameOff, len * 2, StandardCharsets.UTF_16LE);
+                          if (cur.equals(oldName)) {
+                              byte[] nn = newName.getBytes(StandardCharsets.UTF_16LE);
+                              Arrays.fill(arsc, nameOff, nameOff + 256, (byte) 0);
+                              System.arraycopy(nn, 0, arsc, nameOff, nn.length);
+                          }
                       }
-                      return i;
+                      off += size;
                   }
-                  return -1;
               }
 
               // ---------------------------------------------------------------- zip in / out
@@ -397,6 +533,7 @@ jobs:
           package com.web2apk.builder;
 
           import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
           import android.graphics.Canvas;
           import android.graphics.Color;
           import android.graphics.Paint;
@@ -404,22 +541,37 @@ jobs:
           import android.graphics.Typeface;
 
           import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.util.Locale;
 
-          /** Draws a simple launcher icon: a colored rounded square with the app's first letter. */
+          /** Makes launcher icons: a generated letter icon, or a user image cropped to a square. */
           final class IconMaker {
+
+              /** Final icon size in pixels. */
+              static final int SIZE = 256;
 
               private IconMaker() {
               }
 
-              static byte[] make(String name, int seed) {
-                  int size = 192;
+              /** Stable hue seed for the automatic icon color. */
+              static int seedFor(String name) {
+                  return name == null ? 0 : name.trim().toLowerCase(Locale.ROOT).hashCode();
+              }
+
+              /** Draws the generated icon. color == 0 picks a color from the seed. */
+              static Bitmap draw(String name, int seed, int color, int size) {
                   Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
                   Canvas canvas = new Canvas(bmp);
+                  float k = size / 192f;
 
-                  float hue = Math.abs(seed % 360);
+                  int fill = color;
+                  if (fill == 0) {
+                      float hue = Math.abs(seed % 360);
+                      fill = Color.HSVToColor(new float[]{hue, 0.65f, 0.80f});
+                  }
                   Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
-                  bg.setColor(Color.HSVToColor(new float[]{hue, 0.65f, 0.80f}));
-                  canvas.drawRoundRect(new RectF(0, 0, size, size), 44f, 44f, bg);
+                  bg.setColor(fill);
+                  canvas.drawRoundRect(new RectF(0, 0, size, size), 44f * k, 44f * k, bg);
 
                   String letter = "W";
                   String t = name == null ? "" : name.trim();
@@ -431,15 +583,55 @@ jobs:
                   Paint fg = new Paint(Paint.ANTI_ALIAS_FLAG);
                   fg.setColor(Color.WHITE);
                   fg.setTextAlign(Paint.Align.CENTER);
-                  fg.setTextSize(110f);
+                  fg.setTextSize(110f * k);
                   fg.setTypeface(Typeface.DEFAULT_BOLD);
                   Paint.FontMetrics fm = fg.getFontMetrics();
                   float y = size / 2f - (fm.ascent + fm.descent) / 2f;
                   canvas.drawText(letter, size / 2f, y, fg);
+                  return bmp;
+              }
 
+              static byte[] make(String name, int seed, int color) {
+                  Bitmap bmp = draw(name, seed, color, SIZE);
+                  byte[] png = toPng(bmp);
+                  bmp.recycle();
+                  return png;
+              }
+
+              /** Decodes any PNG/JPG/WebP, center-crops it to a square and scales it to SIZE. */
+              static byte[] fromImage(byte[] encoded) throws IOException {
+                  BitmapFactory.Options bounds = new BitmapFactory.Options();
+                  bounds.inJustDecodeBounds = true;
+                  BitmapFactory.decodeByteArray(encoded, 0, encoded.length, bounds);
+                  if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                      throw new IOException("That file is not a readable image (use PNG, JPG or WebP)");
+                  }
+
+                  int shorter = Math.min(bounds.outWidth, bounds.outHeight);
+                  int sample = 1;
+                  while (shorter / (sample * 2) >= SIZE * 2) sample *= 2;
+
+                  BitmapFactory.Options opts = new BitmapFactory.Options();
+                  opts.inSampleSize = sample;
+                  Bitmap src = BitmapFactory.decodeByteArray(encoded, 0, encoded.length, opts);
+                  if (src == null) throw new IOException("Could not decode that image");
+
+                  int side = Math.min(src.getWidth(), src.getHeight());
+                  int x = (src.getWidth() - side) / 2;
+                  int y = (src.getHeight() - side) / 2;
+                  Bitmap square = Bitmap.createBitmap(src, x, y, side, side);
+                  Bitmap scaled = Bitmap.createScaledBitmap(square, SIZE, SIZE, true);
+
+                  byte[] png = toPng(scaled);
+                  if (scaled != square) scaled.recycle();
+                  if (square != src) square.recycle();
+                  src.recycle();
+                  return png;
+              }
+
+              private static byte[] toPng(Bitmap bmp) {
                   ByteArrayOutputStream out = new ByteArrayOutputStream();
                   bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
-                  bmp.recycle();
                   return out.toByteArray();
               }
           }
@@ -453,7 +645,10 @@ jobs:
           import android.content.Intent;
           import android.content.res.ColorStateList;
           import android.database.Cursor;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
           import android.graphics.Color;
+          import android.graphics.Outline;
           import android.graphics.Typeface;
           import android.graphics.drawable.Drawable;
           import android.graphics.drawable.GradientDrawable;
@@ -462,12 +657,18 @@ jobs:
           import android.os.Bundle;
           import android.provider.OpenableColumns;
           import android.provider.Settings;
+          import android.text.Editable;
           import android.text.InputType;
+          import android.text.TextWatcher;
           import android.view.Gravity;
           import android.view.View;
           import android.view.ViewGroup;
+          import android.view.ViewOutlineProvider;
           import android.widget.Button;
           import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.HorizontalScrollView;
+          import android.widget.ImageView;
           import android.widget.LinearLayout;
           import android.widget.ProgressBar;
           import android.widget.ScrollView;
@@ -493,46 +694,76 @@ jobs:
           public class MainActivity extends Activity {
 
               private static final int REQ_PICK = 1;
+              private static final int REQ_ICON = 2;
               private static final long MAX_BYTES = 64L * 1024 * 1024;
+              private static final long MAX_ICON_BYTES = 25L * 1024 * 1024;
 
-              // palette
-              private static final int BG = 0xFF0B1020;
-              private static final int CARD = 0xFF161D33;
-              private static final int STROKE = 0xFF26304D;
-              private static final int INPUT_BG = 0xFF0F1630;
-              private static final int TEXT = 0xFFF1F5F9;
-              private static final int MUTED = 0xFF94A3B8;
-              private static final int ACCENT = 0xFF3B82F6;
-              private static final int ACCENT2 = 0xFF8B5CF6;
-              private static final int OK = 0xFF34D399;
-              private static final int ERR = 0xFFF87171;
+              /** 0 = automatic color, the rest are fixed icon background colors. */
+              private static final int[] ICON_COLORS = {
+                      0, 0xFF3B82F6, 0xFF8B5CF6, 0xFFEC4899, 0xFFEF4444,
+                      0xFFF97316, 0xFF22C55E, 0xFF14B8A6, 0xFF334155
+              };
 
+              private static final class Result {
+                  File apk;
+                  String pkg;
+              }
+
+              private Themes.Theme theme;
+              private int themeIndex;
+
+              // widgets: recreated by buildUi() whenever the theme changes
+              private ScrollView scroll;
               private EditText nameInput;
               private EditText urlInput;
-              private TextView segLink;
-              private TextView segFile;
+              private EditText pkgInput;
+              private Seg sourceSeg;
+              private Seg iconSeg;
               private LinearLayout linkBox;
               private LinearLayout fileBox;
+              private LinearLayout autoIconBox;
+              private LinearLayout customIconBox;
               private TextView pickedText;
+              private TextView customIconText;
+              private ImageView iconPreview;
               private Button buildBtn;
               private LinearLayout statusCard;
+              private LinearLayout resultCard;
               private ProgressBar progress;
               private TextView statusText;
-              private LinearLayout resultCard;
               private TextView resultInfo;
 
+              // state that survives a theme change
+              private String nameVal = "";
+              private String urlVal = "";
+              private String pkgVal = "";
               private boolean linkMode = true;
+              private boolean iconCustom = false;
+              private int iconColor = 0;
+              private byte[] customIconPng;
+              private String customIconName;
               private final List<Uri> picked = new ArrayList<>();
+              private boolean busy;
+              private String statusMsg;
+              private boolean statusErr;
               private File lastApk;
+              private String resultText = "";
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
-                  getWindow().setStatusBarColor(BG);
-                  getWindow().setNavigationBarColor(BG);
+                  themeIndex = getSharedPreferences("web2apk", MODE_PRIVATE).getInt("theme", 0);
+                  buildUi();
+              }
 
-                  ScrollView scroll = new ScrollView(this);
-                  scroll.setBackgroundColor(BG);
+              // ------------------------------------------------------------------ UI construction
+
+              private void buildUi() {
+                  theme = Themes.get(themeIndex);
+                  applySystemBars();
+
+                  scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(theme.bg);
                   scroll.setFillViewport(true);
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
@@ -542,61 +773,140 @@ jobs:
                   setContentView(scroll);
 
                   // ---- header
-                  root.addView(text("Web2APK", 32f, TEXT, true));
-                  TextView sub = text("Turn any link or HTML page into an installable app.", 15f, MUTED, false);
-                  sub.setPadding(0, dp(4), 0, dp(20));
+                  root.addView(text("Web2APK", 32f, theme.text, true));
+                  TextView sub = text("Turn any link or HTML page into an installable app.", 15f, theme.muted, false);
+                  sub.setPadding(0, dp(4), 0, dp(12));
                   root.addView(sub);
 
-                  // ---- main card
+                  // ---- theme picker
+                  TextView themeLabel = label("THEME  ·  " + theme.name.toUpperCase(Locale.ROOT));
+                  themeLabel.setPadding(dp(2), dp(4), 0, dp(8));
+                  root.addView(themeLabel);
+                  HorizontalScrollView themeScroll = new HorizontalScrollView(this);
+                  themeScroll.setHorizontalScrollBarEnabled(false);
+                  LinearLayout chips = new LinearLayout(this);
+                  chips.setOrientation(LinearLayout.HORIZONTAL);
+                  for (int i = 0; i < Themes.ALL.length; i++) {
+                      LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(46), dp(46));
+                      lp.rightMargin = dp(10);
+                      chips.addView(themeChip(i), lp);
+                  }
+                  themeScroll.addView(chips);
+                  root.addView(themeScroll, matchWrap(0));
+
+                  // ---- card 1: name + source
                   LinearLayout card = card();
-                  root.addView(card, matchWrap(0));
+                  root.addView(card, matchWrap(18));
 
                   card.addView(label("APP NAME"));
                   nameInput = input("My App");
+                  nameInput.setText(nameVal);
+                  nameInput.addTextChangedListener(new TextWatcher() {
+                      @Override
+                      public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                      }
+
+                      @Override
+                      public void onTextChanged(CharSequence s, int start, int before, int count) {
+                      }
+
+                      @Override
+                      public void afterTextChanged(Editable s) {
+                          updatePreview();
+                      }
+                  });
                   card.addView(nameInput);
 
                   card.addView(label("SOURCE"));
-                  LinearLayout seg = new LinearLayout(this);
-                  seg.setOrientation(LinearLayout.HORIZONTAL);
-                  seg.setPadding(dp(4), dp(4), dp(4), dp(4));
-                  seg.setBackground(rounded(INPUT_BG, 14, STROKE, 1));
-                  segLink = segment("Website link");
-                  segFile = segment("HTML files");
-                  seg.addView(segLink, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-                  seg.addView(segFile, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-                  segLink.setOnClickListener(v -> setMode(true));
-                  segFile.setOnClickListener(v -> setMode(false));
-                  card.addView(seg);
+                  sourceSeg = new Seg("Website link", "HTML files", linkMode);
+                  sourceSeg.a.setOnClickListener(v -> setSourceMode(true));
+                  sourceSeg.b.setOnClickListener(v -> setSourceMode(false));
+                  card.addView(sourceSeg.view);
 
                   linkBox = new LinearLayout(this);
                   linkBox.setOrientation(LinearLayout.VERTICAL);
                   linkBox.setPadding(0, dp(12), 0, 0);
                   urlInput = input("https://example.com");
                   urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+                  urlInput.setText(urlVal);
                   linkBox.addView(urlInput);
                   card.addView(linkBox);
 
                   fileBox = new LinearLayout(this);
                   fileBox.setOrientation(LinearLayout.VERTICAL);
                   fileBox.setPadding(0, dp(12), 0, 0);
-                  LinearLayout pickCard = new LinearLayout(this);
-                  pickCard.setOrientation(LinearLayout.VERTICAL);
-                  pickCard.setGravity(Gravity.CENTER_HORIZONTAL);
-                  pickCard.setPadding(dp(16), dp(20), dp(16), dp(20));
-                  GradientDrawable dashed = rounded(INPUT_BG, 14, ACCENT, 1);
-                  dashed.setStroke(dp(1), ACCENT, dp(6), dp(4));
-                  pickCard.setBackground(rippled(dashed, 14));
-                  pickCard.setClickable(true);
+                  LinearLayout pickCard = dashedPicker("Choose HTML file(s)",
+                          "Pick your .html file plus any .css, .js or images it uses.");
+                  pickedText = (TextView) pickCard.getChildAt(1);
                   pickCard.setOnClickListener(v -> pickFiles());
-                  TextView pickTitle = text("Choose HTML file(s)", 16f, ACCENT, true);
-                  pickTitle.setGravity(Gravity.CENTER);
-                  pickedText = text("Pick your .html file plus any .css, .js or images it uses.", 13f, MUTED, false);
-                  pickedText.setGravity(Gravity.CENTER);
-                  pickedText.setPadding(0, dp(6), 0, 0);
-                  pickCard.addView(pickTitle);
-                  pickCard.addView(pickedText);
                   fileBox.addView(pickCard);
                   card.addView(fileBox);
+                  refreshPickedText();
+
+                  // ---- card 2: customize
+                  LinearLayout custom = card();
+                  root.addView(custom, matchWrap(16));
+
+                  custom.addView(label("PACKAGE ID  (OPTIONAL)"));
+                  pkgInput = input("com.yourname.myapp");
+                  pkgInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+                  pkgInput.setText(pkgVal);
+                  custom.addView(pkgInput);
+                  TextView pkgHelp = text("Leave empty to generate one. Building the same ID again updates the "
+                          + "installed app. Letters, digits and _ only, with at least one dot.", 12f, theme.muted, false);
+                  pkgHelp.setPadding(dp(2), dp(8), dp(2), 0);
+                  custom.addView(pkgHelp);
+
+                  custom.addView(label("ICON"));
+                  iconSeg = new Seg("Auto letter", "Custom image", !iconCustom);
+                  iconSeg.a.setOnClickListener(v -> setIconMode(false));
+                  iconSeg.b.setOnClickListener(v -> setIconMode(true));
+                  custom.addView(iconSeg.view);
+
+                  LinearLayout iconRow = new LinearLayout(this);
+                  iconRow.setOrientation(LinearLayout.HORIZONTAL);
+                  iconRow.setGravity(Gravity.CENTER_VERTICAL);
+                  iconRow.setPadding(0, dp(14), 0, 0);
+
+                  iconPreview = new ImageView(this);
+                  iconPreview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  roundClip(iconPreview, dp(18));
+                  iconRow.addView(iconPreview, new LinearLayout.LayoutParams(dp(72), dp(72)));
+
+                  LinearLayout rightCol = new LinearLayout(this);
+                  rightCol.setOrientation(LinearLayout.VERTICAL);
+                  LinearLayout.LayoutParams rcLp = new LinearLayout.LayoutParams(
+                          0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                  rcLp.leftMargin = dp(16);
+                  iconRow.addView(rightCol, rcLp);
+
+                  autoIconBox = new LinearLayout(this);
+                  autoIconBox.setOrientation(LinearLayout.VERTICAL);
+                  TextView autoCap = text("Letter icon – pick a color", 13f, theme.muted, false);
+                  autoCap.setPadding(0, 0, 0, dp(8));
+                  autoIconBox.addView(autoCap);
+                  HorizontalScrollView swatchScroll = new HorizontalScrollView(this);
+                  swatchScroll.setHorizontalScrollBarEnabled(false);
+                  LinearLayout swatches = new LinearLayout(this);
+                  swatches.setOrientation(LinearLayout.HORIZONTAL);
+                  for (int i = 0; i < ICON_COLORS.length; i++) {
+                      LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(dp(36), dp(36));
+                      sl.rightMargin = dp(8);
+                      swatches.addView(swatch(ICON_COLORS[i]), sl);
+                  }
+                  swatchScroll.addView(swatches);
+                  autoIconBox.addView(swatchScroll);
+                  rightCol.addView(autoIconBox);
+
+                  customIconBox = new LinearLayout(this);
+                  customIconBox.setOrientation(LinearLayout.VERTICAL);
+                  LinearLayout iconPick = dashedPicker("Choose image", "PNG, JPG or WebP");
+                  iconPick.setPadding(dp(12), dp(12), dp(12), dp(12));
+                  customIconText = (TextView) iconPick.getChildAt(1);
+                  iconPick.setOnClickListener(v -> pickIcon());
+                  customIconBox.addView(iconPick);
+                  rightCol.addView(customIconBox);
+                  custom.addView(iconRow);
 
                   // ---- build button
                   buildBtn = button("Build APK", true);
@@ -607,11 +917,10 @@ jobs:
                   statusCard = card();
                   statusCard.setOrientation(LinearLayout.HORIZONTAL);
                   statusCard.setGravity(Gravity.CENTER_VERTICAL);
-                  statusCard.setVisibility(View.GONE);
                   progress = new ProgressBar(this);
-                  progress.setIndeterminateTintList(ColorStateList.valueOf(ACCENT));
+                  progress.setIndeterminateTintList(ColorStateList.valueOf(theme.accent));
                   statusCard.addView(progress, new LinearLayout.LayoutParams(dp(28), dp(28)));
-                  statusText = text("", 15f, TEXT, false);
+                  statusText = text("", 15f, theme.text, false);
                   LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(
                           0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
                   stLp.leftMargin = dp(14);
@@ -620,9 +929,8 @@ jobs:
 
                   // ---- result card
                   resultCard = card();
-                  resultCard.setVisibility(View.GONE);
-                  resultCard.addView(text("✓  Your app is ready", 18f, OK, true));
-                  resultInfo = text("", 13f, MUTED, false);
+                  resultCard.addView(text("✓  Your app is ready", 18f, theme.ok, true));
+                  resultInfo = text("", 13f, theme.muted, false);
                   resultInfo.setPadding(0, dp(4), 0, dp(14));
                   resultCard.addView(resultInfo);
                   LinearLayout row = new LinearLayout(this);
@@ -640,11 +948,177 @@ jobs:
 
                   // ---- footer
                   TextView foot = text("Apps are signed on this phone. Android or Play Protect may warn about "
-                          + "unknown apps: tap “Install anyway”.", 12f, MUTED, false);
+                          + "unknown apps: tap “Install anyway”.", 12f, theme.muted, false);
                   foot.setPadding(dp(4), dp(20), dp(4), 0);
                   root.addView(foot);
 
-                  setMode(true);
+                  setSourceMode(linkMode);
+                  setIconMode(iconCustom);
+                  renderState();
+              }
+
+              @SuppressWarnings("deprecation")
+              private void applySystemBars() {
+                  getWindow().setStatusBarColor(theme.bg);
+                  getWindow().setNavigationBarColor(theme.bg);
+                  int flags = theme.light
+                          ? (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
+                          : 0;
+                  getWindow().getDecorView().setSystemUiVisibility(flags);
+              }
+
+              /** Segmented two-option switch. */
+              private final class Seg {
+                  final LinearLayout view;
+                  final TextView a;
+                  final TextView b;
+
+                  Seg(String labelA, String labelB, boolean firstSelected) {
+                      view = new LinearLayout(MainActivity.this);
+                      view.setOrientation(LinearLayout.HORIZONTAL);
+                      view.setPadding(dp(4), dp(4), dp(4), dp(4));
+                      view.setBackground(rounded(theme.inputBg, 14, theme.stroke, 1));
+                      a = segText(labelA);
+                      b = segText(labelB);
+                      view.addView(a, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                      view.addView(b, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                      select(firstSelected);
+                  }
+
+                  void select(boolean first) {
+                      style(a, first);
+                      style(b, !first);
+                  }
+
+                  private void style(TextView t, boolean on) {
+                      t.setBackground(on ? rounded(theme.accent, 10) : null);
+                      t.setTextColor(on ? theme.onAccent : theme.muted);
+                  }
+              }
+
+              private void setSourceMode(boolean link) {
+                  linkMode = link;
+                  sourceSeg.select(link);
+                  linkBox.setVisibility(link ? View.VISIBLE : View.GONE);
+                  fileBox.setVisibility(link ? View.GONE : View.VISIBLE);
+              }
+
+              private void setIconMode(boolean custom) {
+                  iconCustom = custom;
+                  iconSeg.select(!custom);
+                  autoIconBox.setVisibility(custom ? View.GONE : View.VISIBLE);
+                  customIconBox.setVisibility(custom ? View.VISIBLE : View.GONE);
+                  if (customIconText != null) {
+                      customIconText.setText(customIconPng == null ? "PNG, JPG or WebP"
+                              : (customIconName == null ? "Image chosen" : customIconName));
+                  }
+                  updatePreview();
+              }
+
+              private void updatePreview() {
+                  if (iconPreview == null) return;
+                  Bitmap bmp = null;
+                  if (iconCustom && customIconPng != null) {
+                      bmp = BitmapFactory.decodeByteArray(customIconPng, 0, customIconPng.length);
+                  }
+                  if (bmp == null) {
+                      String n = nameInput != null ? nameInput.getText().toString() : nameVal;
+                      bmp = IconMaker.draw(n, IconMaker.seedFor(n), iconColor, 144);
+                  }
+                  iconPreview.setImageBitmap(bmp);
+              }
+
+              private void refreshPickedText() {
+                  if (picked.isEmpty()) {
+                      pickedText.setTextColor(theme.muted);
+                      pickedText.setText("Pick your .html file plus any .css, .js or images it uses.");
+                  } else {
+                      StringBuilder sb = new StringBuilder();
+                      for (Uri u : picked) sb.append(displayName(u)).append('\n');
+                      pickedText.setTextColor(theme.text);
+                      pickedText.setText(sb.toString().trim());
+                  }
+              }
+
+              private View themeChip(final int i) {
+                  Themes.Theme t = Themes.ALL[i];
+                  boolean sel = i == themeIndex;
+                  FrameLayout f = new FrameLayout(this);
+                  GradientDrawable outer = new GradientDrawable();
+                  outer.setShape(GradientDrawable.OVAL);
+                  outer.setColor(t.bg);
+                  outer.setStroke(dp(sel ? 3 : 1), sel ? theme.accent : theme.stroke);
+                  f.setBackground(outer);
+                  View dot = new View(this);
+                  GradientDrawable d = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                          new int[]{t.accent, t.accent2});
+                  d.setShape(GradientDrawable.OVAL);
+                  dot.setBackground(d);
+                  f.addView(dot, new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER));
+                  f.setContentDescription(t.name + " theme");
+                  f.setOnClickListener(v -> setTheme(i));
+                  return f;
+              }
+
+              private View swatch(final int color) {
+                  boolean sel = color == iconColor;
+                  FrameLayout f = new FrameLayout(this);
+                  GradientDrawable ring = new GradientDrawable();
+                  ring.setShape(GradientDrawable.OVAL);
+                  ring.setColor(0x00000000);
+                  ring.setStroke(dp(sel ? 3 : 1), sel ? theme.text : theme.stroke);
+                  f.setBackground(ring);
+                  View dot = new View(this);
+                  GradientDrawable d;
+                  if (color == 0) {
+                      d = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                              new int[]{0xFFEF4444, 0xFFEAB308, 0xFF22C55E, 0xFF3B82F6, 0xFF8B5CF6});
+                  } else {
+                      d = new GradientDrawable();
+                      d.setColor(color);
+                  }
+                  d.setShape(GradientDrawable.OVAL);
+                  dot.setBackground(d);
+                  f.addView(dot, new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER));
+                  f.setContentDescription(color == 0 ? "Automatic color" : "Icon color");
+                  f.setOnClickListener(v -> {
+                      iconColor = color;
+                      refreshUi();
+                  });
+                  return f;
+              }
+
+              private void setTheme(int i) {
+                  if (i == themeIndex) return;
+                  themeIndex = i;
+                  getSharedPreferences("web2apk", MODE_PRIVATE).edit().putInt("theme", i).apply();
+                  refreshUi();
+              }
+
+              private void captureInputs() {
+                  if (nameInput != null) nameVal = nameInput.getText().toString();
+                  if (urlInput != null) urlVal = urlInput.getText().toString();
+                  if (pkgInput != null) pkgVal = pkgInput.getText().toString();
+              }
+
+              /** Rebuilds the whole screen (new theme, new icon...) and keeps what the user typed. */
+              private void refreshUi() {
+                  captureInputs();
+                  final int y = scroll != null ? scroll.getScrollY() : 0;
+                  buildUi();
+                  scroll.post(() -> scroll.scrollTo(0, y));
+              }
+
+              private void renderState() {
+                  buildBtn.setEnabled(!busy);
+                  buildBtn.setAlpha(busy ? 0.5f : 1f);
+                  statusCard.setVisibility(statusMsg != null ? View.VISIBLE : View.GONE);
+                  progress.setVisibility(busy ? View.VISIBLE : View.GONE);
+                  statusText.setTextColor(statusErr ? theme.err : theme.text);
+                  statusText.setText(statusMsg == null ? "" : statusMsg);
+                  boolean showResult = lastApk != null && !busy && statusMsg == null;
+                  resultCard.setVisibility(showResult ? View.VISIBLE : View.GONE);
+                  resultInfo.setText(resultText);
               }
 
               // ------------------------------------------------------------------ styling helpers
@@ -665,8 +1139,18 @@ jobs:
                   return rounded(color, radiusDp, 0, 0);
               }
 
-              private Drawable rippled(Drawable content, int radiusDp) {
-                  return new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), content, rounded(Color.WHITE, radiusDp));
+              private Drawable rippled(Drawable content, int radiusDp, int rippleColor) {
+                  return new RippleDrawable(ColorStateList.valueOf(rippleColor), content, rounded(Color.WHITE, radiusDp));
+              }
+
+              private void roundClip(View v, final int radiusPx) {
+                  v.setOutlineProvider(new ViewOutlineProvider() {
+                      @Override
+                      public void getOutline(View view, Outline outline) {
+                          outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), radiusPx);
+                      }
+                  });
+                  v.setClipToOutline(true);
               }
 
               private LinearLayout.LayoutParams matchWrap(int topMarginDp) {
@@ -680,7 +1164,7 @@ jobs:
                   LinearLayout c = new LinearLayout(this);
                   c.setOrientation(LinearLayout.VERTICAL);
                   c.setPadding(dp(18), dp(16), dp(18), dp(18));
-                  c.setBackground(rounded(CARD, 22, STROKE, 1));
+                  c.setBackground(rounded(theme.card, 22, theme.stroke, 1));
                   return c;
               }
 
@@ -695,7 +1179,7 @@ jobs:
               }
 
               private TextView label(String s) {
-                  TextView t = text(s, 12f, MUTED, true);
+                  TextView t = text(s, 12f, theme.muted, true);
                   t.setLetterSpacing(0.1f);
                   t.setPadding(dp(2), dp(14), 0, dp(8));
                   return t;
@@ -704,28 +1188,48 @@ jobs:
               private EditText input(String hint) {
                   EditText e = new EditText(this);
                   e.setHint(hint);
-                  e.setHintTextColor(0xFF5B6784);
-                  e.setTextColor(TEXT);
+                  e.setHintTextColor(theme.hint);
+                  e.setTextColor(theme.text);
                   e.setTextSize(16f);
                   e.setSingleLine(true);
                   e.setPadding(dp(16), dp(14), dp(16), dp(14));
-                  e.setBackground(rounded(INPUT_BG, 14, STROKE, 1));
+                  e.setBackground(rounded(theme.inputBg, 14, theme.stroke, 1));
                   return e;
               }
 
-              private TextView segment(String s) {
-                  TextView t = text(s, 15f, MUTED, true);
+              private TextView segText(String s) {
+                  TextView t = text(s, 15f, theme.muted, true);
                   t.setGravity(Gravity.CENTER);
                   t.setPadding(dp(8), dp(11), dp(8), dp(11));
                   t.setClickable(true);
                   return t;
               }
 
+              /** Dashed tap target: child 0 is the title, child 1 the subtitle. */
+              private LinearLayout dashedPicker(String title, String subtitle) {
+                  LinearLayout c = new LinearLayout(this);
+                  c.setOrientation(LinearLayout.VERTICAL);
+                  c.setGravity(Gravity.CENTER_HORIZONTAL);
+                  c.setPadding(dp(16), dp(20), dp(16), dp(20));
+                  GradientDrawable dashed = rounded(theme.inputBg, 14, theme.accent, 1);
+                  dashed.setStroke(dp(1), theme.accent, dp(6), dp(4));
+                  c.setBackground(rippled(dashed, 14, theme.light ? 0x22000000 : 0x33FFFFFF));
+                  c.setClickable(true);
+                  TextView t = text(title, 16f, theme.accent, true);
+                  t.setGravity(Gravity.CENTER);
+                  TextView s = text(subtitle, 13f, theme.muted, false);
+                  s.setGravity(Gravity.CENTER);
+                  s.setPadding(0, dp(6), 0, 0);
+                  c.addView(t);
+                  c.addView(s);
+                  return c;
+              }
+
               private Button button(String s, boolean primary) {
                   Button b = new Button(this);
                   b.setText(s);
                   b.setAllCaps(false);
-                  b.setTextColor(Color.WHITE);
+                  b.setTextColor(primary ? theme.onAccent : theme.text);
                   b.setTextSize(16f);
                   b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
                   b.setStateListAnimator(null);
@@ -733,31 +1237,19 @@ jobs:
                   b.setMinimumHeight(0);
                   b.setPadding(dp(16), dp(15), dp(16), dp(15));
                   Drawable bg;
+                  int ripple;
                   if (primary) {
                       GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                              new int[]{ACCENT, ACCENT2});
+                              new int[]{theme.accent, theme.accent2});
                       g.setCornerRadius(dp(16));
                       bg = g;
+                      ripple = Color.luminance(theme.onAccent) > 0.5f ? 0x33FFFFFF : 0x22000000;
                   } else {
-                      bg = rounded(0x00000000, 16, STROKE, 1);
+                      bg = rounded(0x00000000, 16, theme.stroke, 1);
+                      ripple = theme.light ? 0x22000000 : 0x33FFFFFF;
                   }
-                  b.setBackground(rippled(bg, 16));
+                  b.setBackground(rippled(bg, 16, ripple));
                   return b;
-              }
-
-              private void setMode(boolean link) {
-                  linkMode = link;
-                  segLink.setBackground(link ? rounded(ACCENT, 10) : null);
-                  segLink.setTextColor(link ? Color.WHITE : MUTED);
-                  segFile.setBackground(link ? null : rounded(ACCENT, 10));
-                  segFile.setTextColor(link ? MUTED : Color.WHITE);
-                  linkBox.setVisibility(link ? View.VISIBLE : View.GONE);
-                  fileBox.setVisibility(link ? View.GONE : View.VISIBLE);
-              }
-
-              private void setBusy(boolean busy) {
-                  buildBtn.setEnabled(!busy);
-                  buildBtn.setAlpha(busy ? 0.5f : 1f);
               }
 
               private void toast(String msg) {
@@ -775,10 +1267,40 @@ jobs:
                   startActivityForResult(i, REQ_PICK);
               }
 
+              private void pickIcon() {
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("image/*");
+                  startActivityForResult(i, REQ_ICON);
+              }
+
               @Override
               protected void onActivityResult(int requestCode, int resultCode, Intent data) {
                   super.onActivityResult(requestCode, resultCode, data);
-                  if (requestCode != REQ_PICK || resultCode != RESULT_OK || data == null) return;
+                  if (resultCode != RESULT_OK || data == null) return;
+
+                  if (requestCode == REQ_ICON) {
+                      final Uri u = data.getData();
+                      if (u == null) return;
+                      final String chosenName = displayName(u);
+                      new Thread(() -> {
+                          try {
+                              byte[] png = IconMaker.fromImage(readAll(u, MAX_ICON_BYTES));
+                              runOnUiThread(() -> {
+                                  customIconPng = png;
+                                  customIconName = chosenName;
+                                  iconCustom = true;
+                                  refreshUi();
+                              });
+                          } catch (Throwable t) {
+                              final String m = t.getMessage() != null ? t.getMessage() : t.toString();
+                              runOnUiThread(() -> toast("Icon: " + m));
+                          }
+                      }).start();
+                      return;
+                  }
+
+                  if (requestCode != REQ_PICK) return;
 
                   picked.clear();
                   ClipData clip = data.getClipData();
@@ -787,22 +1309,13 @@ jobs:
                   } else if (data.getData() != null) {
                       picked.add(data.getData());
                   }
-
-                  StringBuilder sb = new StringBuilder();
                   for (Uri u : picked) {
                       try {
                           getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                       } catch (Exception ignored) {
                       }
-                      sb.append(displayName(u)).append('\n');
                   }
-                  if (picked.isEmpty()) {
-                      pickedText.setTextColor(MUTED);
-                      pickedText.setText("Nothing chosen yet.");
-                  } else {
-                      pickedText.setTextColor(TEXT);
-                      pickedText.setText(sb.toString().trim());
-                  }
+                  refreshPickedText();
               }
 
               private String displayName(Uri uri) {
@@ -818,13 +1331,16 @@ jobs:
                   return name.replace('/', '_').replace('\\', '_');
               }
 
-              private byte[] readAll(Uri uri) throws IOException {
+              private byte[] readAll(Uri uri, long limit) throws IOException {
                   try (InputStream in = getContentResolver().openInputStream(uri)) {
                       if (in == null) throw new IOException("Cannot open " + uri);
                       ByteArrayOutputStream bos = new ByteArrayOutputStream();
                       byte[] buf = new byte[16384];
                       int r;
-                      while ((r = in.read(buf)) > 0) bos.write(buf, 0, r);
+                      while ((r = in.read(buf)) > 0) {
+                          bos.write(buf, 0, r);
+                          if (bos.size() > limit) throw new IOException("File is too large");
+                      }
                       return bos.toByteArray();
                   }
               }
@@ -832,13 +1348,14 @@ jobs:
               // ------------------------------------------------------------------ building
 
               private void startBuild() {
-                  final String name = nameInput.getText().toString().trim();
+                  captureInputs();
+                  final String name = nameVal.trim();
                   if (name.isEmpty()) {
                       toast("Enter an app name");
                       return;
                   }
                   final boolean link = linkMode;
-                  final String url = urlInput.getText().toString().trim();
+                  final String url = urlVal.trim();
                   if (link && url.isEmpty()) {
                       toast("Enter a website link");
                       return;
@@ -847,26 +1364,44 @@ jobs:
                       toast("Choose an HTML file first");
                       return;
                   }
+                  final String customPkg = pkgVal.trim();
+                  if (!customPkg.isEmpty()) {
+                      if (!ApkPatcher.isValidPackage(customPkg)) {
+                          toast("Package ID must look like com.yourname.myapp: letters, digits and _, "
+                                  + "each part starting with a letter, at least one dot");
+                          return;
+                      }
+                      if (customPkg.equals(ApkPatcher.BUILDER_PACKAGE)) {
+                          toast("That ID belongs to Web2APK itself. Pick another one.");
+                          return;
+                      }
+                  }
+                  if (iconCustom && customIconPng == null) {
+                      toast("Choose an icon image, or switch the icon to Auto letter");
+                      return;
+                  }
+                  final byte[] iconPng = iconCustom ? customIconPng : null;
+                  final int colorSnapshot = iconColor;
                   final List<Uri> uris = new ArrayList<>(picked);
 
-                  setBusy(true);
-                  resultCard.setVisibility(View.GONE);
-                  statusCard.setVisibility(View.VISIBLE);
-                  progress.setVisibility(View.VISIBLE);
-                  statusText.setTextColor(TEXT);
-                  statusText.setText("Building your app…");
+                  busy = true;
+                  lastApk = null;
+                  statusMsg = "Building your app…";
+                  statusErr = false;
+                  renderState();
 
                   new Thread(() -> {
                       try {
-                          File apk = doBuild(name, link, url, uris);
-                          runOnUiThread(() -> onBuilt(apk));
+                          Result r = doBuild(name, link, url, uris, customPkg, iconPng, colorSnapshot);
+                          runOnUiThread(() -> onBuilt(r));
                       } catch (Throwable t) {
                           runOnUiThread(() -> onFailed(t));
                       }
                   }).start();
               }
 
-              private File doBuild(String name, boolean link, String url, List<Uri> uris) throws Exception {
+              private Result doBuild(String name, boolean link, String url, List<Uri> uris,
+                                     String customPkg, byte[] customIcon, int color) throws Exception {
                   String config;
                   Map<String, byte[]> www = new LinkedHashMap<>();
 
@@ -879,7 +1414,7 @@ jobs:
                       long total = 0;
                       for (Uri uri : uris) {
                           String fname = displayName(uri);
-                          byte[] data = readAll(uri);
+                          byte[] data = readAll(uri, MAX_BYTES);
                           total += data.length;
                           if (total > MAX_BYTES) throw new IOException("Files are too large (limit 64 MB)");
                           www.put(fname, data);
@@ -893,7 +1428,7 @@ jobs:
                   }
 
                   // Same name + same source => same package name, so rebuilding updates the installed app
-                  String pkg = "com.w2a.x" + hash16(name + "|" + config);
+                  String pkg = customPkg.isEmpty() ? "com.w2a.x" + hash16(name + "|" + config) : customPkg;
 
                   File dir = new File(getCacheDir(), "apks");
                   if (!dir.exists()) dir.mkdirs();
@@ -908,16 +1443,22 @@ jobs:
                       while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
                   }
 
+                  byte[] icon = customIcon != null ? customIcon : IconMaker.make(name, IconMaker.seedFor(name), color);
+
                   File unsigned = new File(dir, "unsigned.tmp");
                   try (OutputStream out = new BufferedOutputStream(new FileOutputStream(unsigned))) {
-                      ApkPatcher.build(template, out, pkg, name, IconMaker.make(name, pkg.hashCode()), config, www);
+                      ApkPatcher.build(template, out, pkg, name, icon, config, www);
                   }
 
                   File signed = new File(dir, safeFileName(name) + ".apk");
                   Signer.sign(unsigned, signed);
                   template.delete();
                   unsigned.delete();
-                  return signed;
+
+                  Result res = new Result();
+                  res.apk = signed;
+                  res.pkg = pkg;
+                  return res;
               }
 
               private static String hash16(String s) throws Exception {
@@ -929,24 +1470,25 @@ jobs:
 
               private static String safeFileName(String name) {
                   String s = name.replaceAll("[^A-Za-z0-9._-]", "_");
-                  return s.isEmpty() ? "app" : s;
+                  return s.replace("_", "").isEmpty() ? "app" : s;
               }
 
-              private void onBuilt(File apk) {
-                  lastApk = apk;
-                  setBusy(false);
-                  statusCard.setVisibility(View.GONE);
-                  resultInfo.setText(apk.getName() + "  ·  " + (apk.length() / 1024) + " KB");
-                  resultCard.setVisibility(View.VISIBLE);
+              private void onBuilt(Result r) {
+                  busy = false;
+                  statusMsg = null;
+                  statusErr = false;
+                  lastApk = r.apk;
+                  resultText = r.apk.getName() + "  ·  " + (r.apk.length() / 1024) + " KB\n" + r.pkg;
+                  renderState();
               }
 
               private void onFailed(Throwable t) {
-                  setBusy(false);
-                  progress.setVisibility(View.GONE);
+                  busy = false;
                   String msg = String.valueOf(t);
                   if (t.getCause() != null) msg += "\n" + t.getCause();
-                  statusText.setTextColor(ERR);
-                  statusText.setText("Build failed:\n" + msg);
+                  statusMsg = "Build failed:\n" + msg;
+                  statusErr = true;
+                  renderState();
               }
 
               // ------------------------------------------------------------------ install / share
@@ -1046,6 +1588,80 @@ jobs:
                           .setV3SigningEnabled(false)
                           .build();
                   signer.sign();
+              }
+          }
+          EOF
+
+          cat > $P/builder/src/main/java/com/web2apk/builder/Themes.java <<'EOF'
+          package com.web2apk.builder;
+
+          /** Color themes for the Web2APK app itself. */
+          final class Themes {
+
+              static final class Theme {
+                  final String name;
+                  final boolean light;
+                  final int bg, card, stroke, inputBg, text, muted, hint;
+                  final int accent, accent2, onAccent, ok, err;
+
+                  Theme(String name, boolean light,
+                        int bg, int card, int stroke, int inputBg,
+                        int text, int muted, int hint,
+                        int accent, int accent2, int onAccent, int ok, int err) {
+                      this.name = name;
+                      this.light = light;
+                      this.bg = bg;
+                      this.card = card;
+                      this.stroke = stroke;
+                      this.inputBg = inputBg;
+                      this.text = text;
+                      this.muted = muted;
+                      this.hint = hint;
+                      this.accent = accent;
+                      this.accent2 = accent2;
+                      this.onAccent = onAccent;
+                      this.ok = ok;
+                      this.err = err;
+                  }
+              }
+
+              // order: name, light, bg, card, stroke, inputBg, text, muted, hint, accent, accent2, onAccent, ok, err
+              static final Theme[] ALL = {
+                      new Theme("Midnight", false,
+                              0xFF0B1020, 0xFF161D33, 0xFF26304D, 0xFF0F1630,
+                              0xFFF1F5F9, 0xFF94A3B8, 0xFF5B6784,
+                              0xFF3B82F6, 0xFF8B5CF6, 0xFFFFFFFF, 0xFF34D399, 0xFFF87171),
+                      new Theme("AMOLED", false,
+                              0xFF000000, 0xFF0F0F12, 0xFF24242A, 0xFF060608,
+                              0xFFF5F5F7, 0xFF9A9AA6, 0xFF5A5A66,
+                              0xFF22D3EE, 0xFF3B82F6, 0xFF00131A, 0xFF4ADE80, 0xFFFB7185),
+                      new Theme("Daylight", true,
+                              0xFFF1F4FA, 0xFFFFFFFF, 0xFFDDE3EE, 0xFFF4F6FB,
+                              0xFF0F172A, 0xFF5B6B84, 0xFF9AA7BC,
+                              0xFF2563EB, 0xFF7C3AED, 0xFFFFFFFF, 0xFF059669, 0xFFDC2626),
+                      new Theme("Ocean", false,
+                              0xFF06202B, 0xFF0C3142, 0xFF174B63, 0xFF082838,
+                              0xFFE6F6FB, 0xFF86B5C7, 0xFF4F7C8E,
+                              0xFF22D3EE, 0xFF2DD4BF, 0xFF032029, 0xFF5EEAD4, 0xFFFB7185),
+                      new Theme("Sunset", false,
+                              0xFF1C0F1A, 0xFF2A1626, 0xFF432339, 0xFF210F1E,
+                              0xFFFFF1EA, 0xFFC9A3B0, 0xFF8A6674,
+                              0xFFEA580C, 0xFFDB2777, 0xFFFFFFFF, 0xFFFBBF24, 0xFFFB7185),
+                      new Theme("Forest", false,
+                              0xFF0C1712, 0xFF14241C, 0xFF21402F, 0xFF0F1D16,
+                              0xFFE8F5EC, 0xFF8DB09B, 0xFF57775F,
+                              0xFF4ADE80, 0xFFA3E635, 0xFF04210F, 0xFF86EFAC, 0xFFFB7185),
+                      new Theme("Sand", true,
+                              0xFFF7F1E8, 0xFFFFFCF7, 0xFFE6DAC8, 0xFFFAF5EC,
+                              0xFF2B2118, 0xFF7A6A58, 0xFFB3A28D,
+                              0xFFB45309, 0xFFDC2626, 0xFFFFFFFF, 0xFF15803D, 0xFFB91C1C),
+              };
+
+              private Themes() {
+              }
+
+              static Theme get(int index) {
+                  return ALL[Math.max(0, Math.min(index, ALL.length - 1))];
               }
           }
           EOF
