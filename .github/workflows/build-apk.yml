@@ -1056,7 +1056,7 @@ jobs:
                   dot.setBackground(d);
                   f.addView(dot, new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER));
                   f.setContentDescription(t.name + " theme");
-                  f.setOnClickListener(v -> setTheme(i));
+                  f.setOnClickListener(v -> selectTheme(i));
                   return f;
               }
 
@@ -1088,7 +1088,7 @@ jobs:
                   return f;
               }
 
-              private void setTheme(int i) {
+              private void selectTheme(int i) {
                   if (i == themeIndex) return;
                   themeIndex = i;
                   getSharedPreferences("web2apk", MODE_PRIVATE).edit().putInt("theme", i).apply();
